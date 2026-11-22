@@ -19,12 +19,26 @@ import sys
 import time
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.abspath(__file__))          # tools/
+ROOT = os.path.dirname(HERE)                               # 仓库根目录
 sys.path.insert(0, HERE)
 
-# 仓库里脚本的文件名（2026-11-23 由 zy.js 改成 .user.js 后缀）
+# 仓库里脚本的文件名（2026-11-23 由 zy.js 改成 .user.js 后缀，并移到根目录）
 SCRIPT_FILE = "microsoft-rewards.user.js"
 SCRIPT_FILE_LEGACY = "zy.js"
+
+
+def script_path(name=None):
+    """取脚本文件的绝对路径（脚本在仓库根目录）；新名不存在就退回旧名/旧布局。"""
+    if name:
+        return name if os.path.isabs(name) else os.path.join(ROOT, name)
+    p = os.path.join(ROOT, SCRIPT_FILE)
+    if not os.path.exists(p):
+        for old in (os.path.join(ROOT, SCRIPT_FILE_LEGACY),
+                    os.path.join(HERE, SCRIPT_FILE)):
+            if os.path.exists(old):
+                return old
+    return p
 
 import sc_deploy as sd  # noqa: E402
 
@@ -33,7 +47,7 @@ LOGIN_URL = SITE + "/en/login"
 EDIT_URL = SITE + "/en/script-edit/6006"
 SHOW_URL = SITE + "/en/script-show-page/6006"
 DEFAULT_PORT = 9333
-DEFAULT_PROFILE = os.path.join(HERE, ".chrome-test", "publish-profile")
+DEFAULT_PROFILE = os.path.join(ROOT, ".chrome-test", "publish-profile")
 
 
 # ---------------------------- CDP 小工具 ----------------------------
@@ -197,7 +211,7 @@ def read_notes(path, ver):
 
 
 def cmd_publish(args):
-    path = os.path.join(HERE, args.code) if not os.path.isabs(args.code) else args.code
+    path = script_path(args.code)
     with open(path, encoding="utf-8") as f:
         code = f.read()
     ver = sd.meta_version(code)
@@ -250,7 +264,7 @@ def store_meta(script_id="6006"):
 
 def cmd_status(args):
     m = store_meta()
-    local_ver = sd.meta_version(open(os.path.join(HERE, args.code), encoding="utf-8").read())
+    local_ver = sd.meta_version(open(script_path(args.code), encoding="utf-8").read())
     print("线上：%s v%s（changelog: %s）" % (m["name"], m["version"], m["changelog"]))
     print("本地：%s v%s" % (args.code, local_ver))
     if sd.wait_cdp(args.port, timeout=1.5):
@@ -291,7 +305,7 @@ DUMP_JS = r"""
 
 
 # ---------------------------- 登录状态落盘 ----------------------------
-AUTH_FILE = os.path.join(HERE, ".workbuddy", "tmp", "sc_auth.json")
+AUTH_FILE = os.path.join(ROOT, ".workbuddy", "tmp", "sc_auth.json")
 
 
 def save_auth(port):
@@ -372,7 +386,7 @@ def cmd_dump(args):
     print("登录：%s" % ("✅ " + ", ".join(extra) if ok else "❌ 未登录"))
     tid = goto(args.port, args.url or EDIT_URL, wait=args.wait)
     data = page_eval(args.port, DUMP_JS)
-    out = os.path.join(HERE, ".workbuddy", "tmp", "edit_probe.json")
+    out = os.path.join(ROOT, ".workbuddy", "tmp", "edit_probe.json")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)

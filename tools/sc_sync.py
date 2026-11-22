@@ -15,23 +15,28 @@ import sys
 import time
 import urllib.request
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.abspath(__file__))          # tools/
+ROOT = os.path.dirname(HERE)                               # 仓库根目录
 
 # 仓库里脚本的文件名。2026-11-23 由 zy.js 改成 .user.js 后缀，方便在 Gitea
-# 页面直接点安装。旧名保留兜底：在还没同步这次改名的分支/clone 上跑也能找到文件。
+# 页面直接点安装，并移到根目录。旧名保留兜底：在还没同步这次改名的分支/clone 上跑也能找到文件。
 SCRIPT_FILE = "microsoft-rewards.user.js"
 SCRIPT_FILE_LEGACY = "zy.js"
 
 
 def script_path(name=None):
-    """取脚本文件的绝对路径；未显式指定时，新名不存在就退回旧名。"""
+    """取脚本文件的绝对路径（脚本在仓库根目录）；新名不存在就退回旧名。"""
     if name:
-        return name if os.path.isabs(name) else os.path.join(HERE, name)
-    p = os.path.join(HERE, SCRIPT_FILE)
+        return name if os.path.isabs(name) else os.path.join(ROOT, name)
+    p = os.path.join(ROOT, SCRIPT_FILE)
     if not os.path.exists(p):
-        legacy = os.path.join(HERE, SCRIPT_FILE_LEGACY)
+        legacy = os.path.join(ROOT, SCRIPT_FILE_LEGACY)
         if os.path.exists(legacy):
             return legacy
+        # 兼容脚本还在 tools/ 里的旧布局
+        old = os.path.join(HERE, SCRIPT_FILE)
+        if os.path.exists(old):
+            return old
     return p
 
 SITE = "https://scriptcat.org"
@@ -129,7 +134,7 @@ def cmd_check(args):
 
 
 def cmd_push(args):
-    path = args.code if os.path.isabs(args.code) else os.path.join(HERE, args.code)
+    path = script_path(args.code)
     with open(path, encoding="utf-8") as f:
         code = f.read()
     ver = meta_version(code)

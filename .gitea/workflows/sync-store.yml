@@ -6,9 +6,9 @@ on:
     branches: [main, master]
     paths:
       - 'microsoft-rewards.user.js'
-      - 'release-notes/**'
-      - 'CHANGELOG.md'
-      - 'sc_sync.py'
+      - 'tools/release-notes/**'
+      - 'tools/CHANGELOG.md'
+      - 'tools/sc_sync.py'
       - '.gitea/workflows/sync-store.yml'
   workflow_dispatch: {}
 
@@ -20,11 +20,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 看版本差
-        run: python3 sc_sync.py --check
+        run: python3 tools/sc_sync.py --check
 
       - name: 推送到脚本猫
         env:
           SCRIPTCAT_WEBHOOK: ${{ secrets.SCRIPTCAT_WEBHOOK }}
         run: |
-          python3 sc_sync.py --push --dry
-          python3 sc_sync.py --push
+          python3 tools/sc_sync.py --push --dry
+          python3 tools/sc_sync.py --push
