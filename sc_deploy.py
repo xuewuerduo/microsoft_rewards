@@ -813,6 +813,172 @@ def reload_ext(port, ext_id, log=print):
     return True
 
 
+def _ver_tuple(v):
+    """把 "1.5.2" / "v1.2.3" 解析成可比较的元组；解析不出来返回 None。"""
+    nums = re.findall(r"\d+", str(v or ""))
+    return tuple(int(x) for x in nums) if nums else None
+
+
+def _extensions_page_ws(port, log=None):
+    """chrome://extensions 页面的 ws（没有就后台开一个，复用已有的）。
+    chrome.developerPrivate 只在这个上下文里暴露：读扩展版本、reload、点「更新」都靠它。"""
+    try:
+        for t in list_targets(port):
+            if (t.get("url") or "").startswith("chrome://extensions"):
+                ws = t.get("webSocketDebuggerUrl")
+                if ws:
+                    return ws
+    except Exception:
+        return None
+    opened = False
+    for opener in (open_page, _create_target):
+        try:
+            opener(port, "chrome://extensions/")
+            opened = True
+            break
+        except Exception:
+            continue
+    if not opened:
+        if log:
+            log("    [!] 打不开 chrome://extensions/")
+        return None
+    time.sleep(1.6)
+    try:
+        for t in list_targets(port):
+            if (t.get("url") or "").startswith("chrome://extensions"):
+                return t.get("webSocketDebuggerUrl")
+    except Exception:
+        return None
+    return None
+
+
+_EXT_INFO_JS = r"""(async function(){
+  var dp = (typeof chrome !== 'undefined') ? chrome.developerPrivate : null;
+  if (!dp) return JSON.stringify({err: "chrome.developerPrivate 不可用"});
+  var id = __ID__;
+  function call(fn, arg){
+    return new Promise(function(res){
+      try {
+        if (arg === undefined) fn(function(x){ res(x); });
+        else fn(arg, function(x){ res(x); });
+      } catch(e) { res(null); }
+    });
+  }
+  var info = await call(dp.getExtensionInfo.bind(dp), id);
+  if (!info) {
+    var list = await call(dp.getExtensionsInfo.bind(dp), {includeDisabled: true}) || [];
+    info = (list || []).filter(function(e){ return e.id === id; })[0] || null;
+  }
+  if (!info) return JSON.stringify({err: "extension not found"});
+  return JSON.stringify({id: info.id || id, name: info.name || "",
+                         version: info.version || "", state: info.state,
+                         location: info.location || "",
+                         updateUrl: info.updateUrl || ""});
+})()"""
+
+
+def ext_info(port, ext_id, log=None):
+    """读已加载扩展的 id/name/version/state；读不到返回 {}（不抛异常）。"""
+    ws = _extensions_page_ws(port, log=log)
+    if not ws:
+        return {}
+    sess = _CdpSession(ws)
+    try:
+        raw = sess.evaluate(_EXT_INFO_JS.replace("__ID__", json.dumps(ext_id)), timeout=20)
+        d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        return d if isinstance(d, dict) and not d.get("err") else {}
+    except Exception:
+        return {}
+    finally:
+        sess.close()
+
+
+def disk_ext_version(ext_dir):
+    """解包扩展目录里 manifest.json 的版本号（取不到返回空串）。"""
+    if not ext_dir:
+        return ""
+    try:
+        with open(os.path.join(ext_dir, "manifest.json"), encoding="utf-8") as f:
+            return str((json.load(f) or {}).get("version") or "")
+    except Exception:
+        return ""
+
+
+_AUTO_UPDATE_JS = r"""(function(){return new Promise(function(res){
+  var dp = (typeof chrome !== 'undefined') ? chrome.developerPrivate : null;
+  if (!dp || !dp.autoUpdate) return res(JSON.stringify({ok:false, err:"没有 autoUpdate"}));
+  try { dp.autoUpdate(function(){ res(JSON.stringify({ok:true})); }); }
+  catch(e) { res(JSON.stringify({ok:false, err:String(e)})); }
+});})()"""
+
+
+def auto_update_ext(port, log=None):
+    """点一次 chrome://extensions 顶部的「更新」——只对商店安装的扩展有效。
+    解包扩展没有更新源，点了也不会有变化（不报错，交给调用方比对版本）。"""
+    ws = _extensions_page_ws(port, log=log)
+    if not ws:
+        return False
+    sess = _CdpSession(ws)
+    try:
+        raw = sess.evaluate(_AUTO_UPDATE_JS, timeout=30)
+        d = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        return bool(isinstance(d, dict) and d.get("ok"))
+    except Exception:
+        return False
+    finally:
+        sess.close()
+
+
+def ensure_ext_current(port, ext_id, ext_dir=None, allow_store=True, log=print):
+    """把已加载的脚本猫扩展对齐到「磁盘上那份」或商店最新。只 reload，不重启浏览器。
+
+    · 磁盘解包目录版本更高 → reload 让 Chrome 重读文件（同路径同 ID，脚本与授权都不丢）
+    · 版本相同            → 什么都不做
+    · 磁盘版本更低        → 保留浏览器里的（避免把开发版顶回旧版）
+    · 没有磁盘目录（商店 CRX）→ 点一次「更新」让商店自己拉
+    返回 {ok, changed, before, after, source}
+    """
+    res = {"ok": False, "changed": False, "before": "", "after": "", "source": ""}
+    before = str(ext_info(port, ext_id, log=log).get("version") or "")
+    res["before"] = res["after"] = before
+    disk = disk_ext_version(ext_dir)
+    if disk:
+        res["source"] = "disk"
+        dt, bt = _ver_tuple(disk), _ver_tuple(before)
+        if bt is not None and dt is not None and dt <= bt:
+            res["ok"] = True
+            return res
+        log("    · 磁盘扩展 v%s，浏览器里是 v%s → 重载让 Chrome 读新文件…" % (disk, before or "?"))
+        if not reload_ext(port, ext_id, log=log):
+            return res
+    elif allow_store:
+        res["source"] = "store"
+        if not auto_update_ext(port, log=log):
+            log("    · 商店更新未受理（解包扩展没有更新源，或网络不通）")
+            res["ok"] = True          # 不是错误：本来就没有商店通道
+            return res
+        time.sleep(3.0)
+    else:
+        res["ok"] = True
+        return res
+
+    time.sleep(1.0)
+    after = str(ext_info(port, ext_id, log=log).get("version") or "")
+    # reload 了但版本没变：说明浏览器里这份扩展不是从该解包目录加载的（商店 CRX 装的），
+    # 此时退回「商店更新」再试一次，避免把「reload 无效」误报成「已是最新」。
+    if disk and before and after and after == before and allow_store:
+        log("    · 重载后版本没变（浏览器里这份不是该解包目录），改走商店更新…")
+        if auto_update_ext(port, log=log):
+            time.sleep(3.0)
+            again = str(ext_info(port, ext_id, log=log).get("version") or "")
+            if again:
+                after = again
+    res["after"] = after or before
+    res["ok"] = bool(after or before)
+    res["changed"] = bool(after and before and after != before)
+    return res
+
+
 def set_silent_update(port, ext_id=None, log=print):
     """打开「静默更新非重大变更」。返回 (ok, changed)。
     changed=True 表示刚写入，必须 reload 扩展才生效（SW 里缓存了旧值）。

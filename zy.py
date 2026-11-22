@@ -71,12 +71,18 @@
  可选 SC_SCRIPT_ID             scriptcat 商店脚本 ID（默认 6006 微软积分（优化版））
  可选 SC_SCRIPT_NAME           已装脚本名片段（默认「微软积分」）
  可选 SC_EXT_DIR               脚本猫解包扩展目录（默认从 /app/extensions、/data/extensions 找）
- 可选 SC_AUTO_UPDATE           浏览器起来后先比对「已装脚本 vs 商店最新」，落后就更新
+ 可选 SC_AUTO_UPDATE           任务开跑前校准「已装脚本 vs 商店最新」，落后就更新
                                 （默认 1；0=只在 --update-script 时手动更新）
+ 可选 SC_EXT_UPDATE            同上，顺带校准脚本猫扩展插件本身的版本
+                                （默认 1；0=不检查扩展，只校准脚本）
+ 可选 SC_CALIB_WAIT_SEC        等「脚本猫首轮心跳」再校准的最长秒数（默认 180）
+                                校准时机：启动阶段只确保可用，等脚本加载好、任务还没
+                                开跑时统一做一次，避免刚启动就 reload 打断初始化
 
    命令行维护参数（面板正常运行时不带参数，行为完全不变）
      python3 zy.py --update-script    手动把签到脚本更新到商店最新版
                                       （浏览器没在跑会临时拉起，完成后自动关闭）
+     python3 zy.py --update-ext       手动把脚本猫扩展插件更新到最新（磁盘新版/商店）
      python3 zy.py --install-script   重新安装/修复扩展 + 脚本 + Cookie 授权
      python3 zy.py --script-status    查看各账号已装脚本版本
 
@@ -312,9 +318,13 @@ SC_AUTO_DEPLOY = os.getenv("SC_AUTO_DEPLOY", "1").strip().lower() not in ("0", "
 SC_SCRIPT_ID = os.getenv("SC_SCRIPT_ID", "6006")        # scriptcat 商店脚本 ID（微软积分（优化版））
 SC_SCRIPT_NAME = os.getenv("SC_SCRIPT_NAME", "微软积分")  # 已装脚本名片段
 SC_EXT_DIR = os.getenv("SC_EXT_DIR", "")                # 脚本猫解包扩展目录（留空自动探测）
-# 浏览器起来后先比对「已装脚本版本 vs 商店最新」，落后就更新到最新（默认开）。
-# 和脚本猫自己的静默更新是两条保险：静默更新按它自己的节奏，这里在每次任务开始前校准一次。
+# 任务开跑前校准版本（默认开）。注意时机：浏览器刚起来时**不**做，等脚本猫首轮心跳
+# 到了（脚本已加载、任务还没开跑）再统一做一次，避免刚启动就 reload 打断初始化。
 SC_AUTO_UPDATE = os.getenv("SC_AUTO_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
+# 同上，顺带校准脚本猫扩展插件本身（磁盘解包目录有新版本就 reload；商店版点一次更新）
+SC_EXT_UPDATE = os.getenv("SC_EXT_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
+# 等「脚本猫首轮心跳」的上限秒数：等到就校准，等不到也按这个时间兜底校准一次
+SC_CALIB_WAIT_SEC = int(os.getenv("SC_CALIB_WAIT_SEC", "180") or 180)
 
 # 🖥️ 显示模式（默认无头浏览器省资源；检测未登录时按需拉起 noVNC 桌面让用户登录）
 # HEADLESS_MODE: auto(默认) / always(永远无头) / gui(始终带界面)
@@ -765,6 +775,8 @@ _ALL_DONE = threading.Event()
 _WATCH_START = {}          # name -> 开始监视时刻（浏览器启动完成时登记）
 _SCRIPT_FOOTPRINT = {}     # name -> True（采集到该账号任意用户脚本日志）
 _LAST_LOG_TS = {}          # name -> 最近一条用户脚本日志的时刻（用于「跑到一半停摆」判断）
+_FIRST_LOG_TS = {}         # name -> 首条用户脚本日志的时刻（脚本已加载好的信号，用于校准时机）
+_CALIBRATED = threading.Event()   # 本次运行是否已做过「开跑前版本校准」
 _NORUN_ALERTED = set()     # 已告警过的账号，避免每轮检查都重复弹
 _STALL_ALERTED = {}        # name -> 上次「停摆」告警时刻（隔一段时间才重复告警/重试修复）
 _STALL_TRIES = {}          # name -> 已经尝试过几次自动修复（第 2 次起改成 reload 扩展）
@@ -782,6 +794,7 @@ def mark_script_footprint(name):
     """采集到该账号任意用户脚本日志时调用：记下脚本确实在跑"""
     with _NORUN_LOCK:
         _SCRIPT_FOOTPRINT[name] = True
+        _FIRST_LOG_TS.setdefault(name, time.time())
         _LAST_LOG_TS[name] = time.time()
 
 
@@ -1346,13 +1359,13 @@ def _store_script_version(sd):
     return ver
 
 
-def _ensure_script_latest(name: str, port: int, user_dir: str = None) -> bool:
-    """浏览器起来后校准脚本版本：比商店旧就更新到最新（幂等，失败不影响任务）。
+def _ensure_script_latest(name: str, port: int, user_dir: str = None,
+                          ext_id: str = None) -> bool:
+    """校准签到脚本版本：比商店旧就更新到最新（幂等，失败不影响任务）。
 
-    为什么放在这里而不是等脚本猫自己静默更新：
-      · 静默更新按它自己的节奏走（实跑日志里 15:03 才更新掉一版），中间这段时间
-        跑的还是旧逻辑；
-      · 面板重启/换镜像后已装版本可能落后很多，任务开跑前先对齐最省事。
+    调用时机由调用方决定：正常任务里只在「脚本猫首轮心跳到了、任务还没开跑」时
+    统一做一次（见 _pre_task_calibrate），不在浏览器刚拉起时做。
+    ext_id 已由调用方认好时直接传进来，省一次 chrome://extensions 探测。
     返回 True = 已是最新（或已成功更新）；False = 检查/更新没成功（只记日志）。
     """
     if not SC_AUTO_UPDATE or not port:
@@ -1364,8 +1377,8 @@ def _ensure_script_latest(name: str, port: int, user_dir: str = None) -> bool:
     try:
         # 扩展 ID 只认一次：读版本、更新都要它，重复去 chrome://extensions 认太慢。
         # guess=False：路径哈希只是猜的，猜错会让后面误判「扩展没加载」。
-        eid = sd.resolve_ext_id(port, ext_dir=_scriptcat_ext_dir(user_dir),
-                                user_dir=user_dir, guess=False) or None
+        eid = ext_id or sd.resolve_ext_id(port, ext_dir=_scriptcat_ext_dir(user_dir),
+                                          user_dir=user_dir, guess=False) or None
         st = sd.get_status(port, name_hint=SC_SCRIPT_NAME, ext_id=eid)
         if not st.get("ok"):
             logger.warning(f"  ⚠️ 账号 {name} 读不到已装脚本版本：{st.get('detail') or '未知'}")
@@ -1397,6 +1410,135 @@ def _ensure_script_latest(name: str, port: int, user_dir: str = None) -> bool:
     except Exception as e:
         logger.warning(f"  ⚠️ 账号 {name} 脚本版本检查异常（不影响任务继续）: {e}")
         return False
+
+
+# ── 开跑前一次性校准（脚本 + 扩展插件）────────────────────────────────────
+def _ensure_ext_latest(name: str, port: int, user_dir: str = None,
+                       ext_id: str = None) -> dict:
+    """校准脚本猫扩展插件本身：磁盘上有更新版本就 reload，商店版就点一次更新。
+
+    只 reload 扩展，**绝不重启浏览器**：同一路径的扩展 ID 不变，脚本与
+    Cookie 授权都保留，代价只是后台 SW 重建一次。
+    返回 {ok, changed, before, after}；changed=True 时调用方应等几秒再读脚本。
+    """
+    out = {"ok": False, "changed": False, "before": "", "after": ""}
+    if not SC_EXT_UPDATE or not port:
+        return out
+    sd = _load_sc_deploy()
+    if not sd:
+        return out
+    ext_dir = _scriptcat_ext_dir(user_dir)
+    eid = ext_id or sd.resolve_ext_id(port, ext_dir=ext_dir, user_dir=user_dir,
+                                      guess=False) or None
+    if not eid:
+        logger.info(f"  🔎 账号 {name} 认不到脚本猫扩展 ID，跳过扩展版本校准")
+        return out
+    try:
+        r = sd.ensure_ext_current(port, eid, ext_dir=ext_dir, allow_store=True,
+                                  log=lambda m: logger.info("   " + str(m).strip()))
+    except Exception as e:
+        logger.warning(f"  ⚠️ 账号 {name} 扩展版本检查异常（不影响任务继续）: {e}")
+        return out
+    out.update(ok=bool(r.get("ok")), changed=bool(r.get("changed")),
+               before=r.get("before") or "", after=r.get("after") or "")
+    if r.get("changed"):
+        logger.info(f"  ⬆️  账号 {name} 脚本猫扩展已更新：v{r.get('before')} → v{r.get('after')}"
+                    f"（来源：{'磁盘解包目录' if r.get('source') == 'disk' else '商店'}）")
+        return out
+    ver = r.get("after") or r.get("before") or "?"
+    if r.get("ok"):
+        logger.info(f"  🔎 账号 {name} 脚本猫扩展已是最新 v{ver}")
+        return out
+    logger.info(f"  🔎 账号 {name} 扩展版本未确认（v{ver}），继续执行任务")
+    return out
+
+
+def _calibrate_one(name: str, port: int, user_dir: str):
+    """单个账号的开跑前校准：先扩展插件，再签到脚本（共用一次扩展 ID 探测）。"""
+    sd = _load_sc_deploy()
+    if not sd:
+        return
+    eid = None
+    try:
+        eid = sd.resolve_ext_id(port, ext_dir=_scriptcat_ext_dir(user_dir),
+                                user_dir=user_dir, guess=False) or None
+    except Exception:
+        eid = None
+    ext = {"changed": False}
+    if SC_EXT_UPDATE:
+        ext = _ensure_ext_latest(name, port, user_dir, ext_id=eid)
+    if SC_AUTO_UPDATE:
+        if ext.get("changed"):
+            # 扩展刚 reload 过，后台 SW 还在重建，脚本列表可能一时读不到 → 等一会儿再读
+            logger.info(f"   · 账号 {name} 扩展刚重载，等 4 秒让脚本猫重新注册脚本…")
+            time.sleep(4)
+        for attempt in range(3):
+            try:
+                # 扩展 ID 已认好，传进去省一次 chrome://extensions 探测
+                if _ensure_script_latest(name, port, user_dir, ext_id=eid):
+                    return
+            except Exception as e:
+                logger.warning(f"  ⚠️ 账号 {name} 脚本版本校准异常: {e}")
+                return
+            if attempt < 2:
+                logger.info(f"   · 账号 {name} 脚本版本暂未读到，5 秒后重试（{attempt + 1}/2）")
+                time.sleep(5)
+
+
+def _pre_task_calibrate(browsers, plan=None, max_wait=None):
+    """任务正式开跑前的一次性版本校准（脚本 + 扩展插件）。
+
+    时机设计（用户要求）：
+      · 启动阶段只把扩展/脚本「装好、启用、授权」，不做版本比对、不 reload；
+      · 等脚本猫首轮心跳出现（说明扩展加载完、脚本读完计划，任务还没开跑），
+        这时统一校准一次 —— 既不会漏掉落后版本，也不会在启动初始化期间
+        把后台上下文打断；
+      · 心跳等不到（脚本没跑起来）就按 max_wait 兜底校准，只做一次。
+    全程只对已经在跑的浏览器操作，不重启浏览器，也不重复打开。
+    """
+    targets = [(n, p, u) for n, u, _pid, p, _r in browsers
+               if p and not _ACCOUNT_DONE.get(n)]
+    if not targets:
+        return
+    if _CALIBRATED.is_set():
+        return
+    limit = SC_CALIB_WAIT_SEC if max_wait is None else int(max_wait)
+    deadline_ts = time.time() + max(0, limit)
+    why = ""
+    while True:
+        now = time.time()
+        with _NORUN_LOCK:
+            ready = [n for n, _, _ in targets if n in _FIRST_LOG_TS]
+        if len(ready) >= len(targets):
+            why = "脚本猫首轮心跳已到"
+            break
+        if now >= deadline_ts:
+            why = f"等了 {limit} 秒仍未见首轮心跳"
+            break
+        if _TERMINATED or _ALL_DONE.is_set():
+            return
+        dl = (plan or {}).get("deadline")
+        if dl is not None:
+            try:
+                if datetime.now() >= dl:
+                    return          # 已到收工时间，没必要再折腾版本
+            except Exception:
+                pass
+        # 用 Event.wait 而不是 sleep：全部账号提前完成时能立刻退出
+        if _ALL_DONE.wait(5) or _TERMINATED:
+            return
+
+    logger.info(f"🧩 开跑前版本校准（{why}）：只对已运行的浏览器操作，扩展只 reload、不重启浏览器")
+    ths = []
+    for n, p, u in targets:
+        t = threading.Thread(target=_calibrate_one, args=(n, p, u),
+                             name=f"calib-{n}", daemon=True)
+        t.start()
+        ths.append(t)
+    for t in ths:
+        t.join(timeout=240)
+    _CALIBRATED.set()
+    logger.info("🧩 开跑前版本校准结束（本次运行不再重复检查）")
 
 
 def launch_chrome(user_dir: str, port: int = 0, headless: bool = True):
@@ -3513,19 +3655,13 @@ def main():
 
         # 🧩 新用户首次运行：用同目录 sc_deploy.py 装脚本猫扩展 + 商店脚本 + Cookie 授权
         #    已装过的账号这一步只做「确保启用/补授权」的轻量检查，不会重复安装。
+        #    版本校准**不在这里**做：挪到任务正式开跑前统一做一次（_pre_task_calibrate），
+        #    免得刚启动就 reload 打断脚本猫初始化，也免得每个账号各查一遍。
         if pid and port:
-            deployed = False
             try:
-                deployed = _ensure_script_deploy(name, user_dir, port)
+                _ensure_script_deploy(name, user_dir, port)
             except Exception as e:
                 logger.warning(f"⚠️ 账号 {name} 脚本猫部署失败（不影响任务继续）: {e}")
-            # ⬆️ 再校准版本：已装脚本落后于商店最新版就先更新，避免拿旧逻辑跑一整天。
-            #    （新装账号上面已装的是商店最新版，这里通常只读一次版本就跳过。）
-            if deployed:
-                try:
-                    _ensure_script_latest(name, port, user_dir)
-                except Exception as e:
-                    logger.warning(f"⚠️ 账号 {name} 脚本版本校准失败（不影响任务继续）: {e}")
 
         # 登录判断：rewards.bing.com + email 比对
         result = {"ok": None, "matched": False, "reason": "CDP 未开启，跳过登录检查", "current_email": None}
@@ -3715,6 +3851,15 @@ def main():
     if ALERT_NO_RUN and SC_LOG_CAPTURE:
         threading.Thread(target=_no_run_watch, name="no-run-watch", daemon=True).start()
 
+    # 🧩 开跑前一次性版本校准（脚本 + 扩展插件）：等脚本猫首轮心跳到了再动手，
+    #    启动阶段不 reload，避免刚起来就把后台上下文打断；只做一次。
+    if (SC_AUTO_UPDATE or SC_EXT_UPDATE) and browsers:
+        max_wait = SC_CALIB_WAIT_SEC if SC_LOG_CAPTURE else min(30, max(5, SC_CALIB_WAIT_SEC))
+        if not SC_LOG_CAPTURE:
+            logger.info(f"ℹ️  未开启脚本猫日志采集（等不到首轮心跳）→ {max_wait} 秒后直接校准版本")
+        threading.Thread(target=_pre_task_calibrate, args=(browsers, plan, max_wait),
+                         name="pre-task-calibrate", daemon=True).start()
+
     try:
         # 保持运行，等待「脚本猫-微软积分商城签到脚本」完成（心跳每 1 小时汇报一次；全部账号完成后提前退出）
         HEARTBEAT = 3600
@@ -3864,21 +4009,87 @@ def _cli_update_scripts(install: bool = False) -> int:
     return rc
 
 
+def _cli_update_ext() -> int:
+    """命令行手动更新脚本猫扩展插件（磁盘解包目录有新版本 / 商店有新版本时）。
+
+    和 --update-script 一样：浏览器在跑就直接操作，没跑就临时拉起、完事关掉。
+    """
+    sd = _load_sc_deploy()
+    if not sd:
+        logger.error("❌ 找不到同目录 sc_deploy.py，无法执行扩展维护")
+        return 1
+    accounts = load_accounts()
+    logger.info(f"🔧 手动更新「脚本猫」扩展插件，共 {len(accounts)} 个账号")
+    rc = 0
+    for i, acc in enumerate(accounts):
+        name = acc["name"]
+        user_dir = os.path.join(CHROME_USER_DATA_BASE, f"user-{name}")
+        Path(user_dir).mkdir(parents=True, exist_ok=True)
+        port = CDP_BASE_PORT + i if CDP_BASE_PORT else 0
+        if not port:
+            logger.warning(f"⚠️ CDP_BASE_PORT=0（CDP 关闭），无法维护账号 {name}")
+            rc = 1
+            continue
+        started = False
+        if not get_running_pid(user_dir):
+            logger.info(f"🌐 账号 {name} 浏览器未运行，临时拉起（CDP {port}），完成后自动关闭")
+            try:
+                launch_chrome(user_dir, port, headless=True)
+            except Exception as e:
+                logger.error(f"❌ 账号 {name} 启动浏览器失败: {e}")
+                rc = 1
+                continue
+            wait_browser_ready(user_dir, port, timeout=40)
+            started = True
+        try:
+            ext_dir = _scriptcat_ext_dir(user_dir)
+            disk = sd.disk_ext_version(ext_dir)
+            eid = sd.resolve_ext_id(port, ext_dir=ext_dir, user_dir=user_dir) or None
+            if not eid:
+                logger.error(f"❌ 账号 {name}：认不到脚本猫扩展")
+                rc = 1
+                continue
+            r = sd.ensure_ext_current(port, eid, ext_dir=ext_dir, allow_store=True,
+                                      log=lambda m: logger.info("   " + str(m).strip()))
+            if r.get("changed"):
+                logger.info(f"✅ 账号 {name}：扩展 v{r.get('before')} → v{r.get('after')}"
+                            f"（{'磁盘 v%s' % disk if r.get('source') == 'disk' else '商店'}）")
+            elif r.get("ok"):
+                logger.info(f"✅ 账号 {name}：扩展已是最新 v{r.get('after') or r.get('before')}"
+                            f"（磁盘 v{disk or '未提供'}）")
+            else:
+                logger.error(f"❌ 账号 {name}：扩展版本未确认（v{r.get('before')}）")
+                rc = 1
+        except Exception as e:
+            logger.error(f"❌ 账号 {name}：扩展更新异常 {e}")
+            rc = 1
+        finally:
+            if started:
+                logger.info(f"🧹 关闭为维护临时拉起的 {name} 浏览器")
+                close_browser(user_dir, port)
+    logger.info(f"🔧 手动更新扩展结束{'（全部成功）' if rc == 0 else '（有失败项，见上）'}")
+    return rc
+
+
 if __name__ == "__main__":
     # 命令行维护参数（面板正常运行时不带参数，行为不变）：
     #   python3 zy.py --update-script    手动把签到脚本更新到商店最新版
+    #   python3 zy.py --update-ext       手动更新脚本猫扩展插件
     #   python3 zy.py --install-script   给所有账号重新安装/修复扩展 + 脚本
     #   python3 zy.py --script-status    只看各账号脚本版本
     _argv = sys.argv[1:]
     if any(a in ("-h", "--help") for a in _argv):
-        print("用法: python3 zy.py [--update-script | --install-script | --script-status]\n"
+        print("用法: python3 zy.py [--update-script | --update-ext | --install-script | --script-status]\n"
               "  不带参数            正常执行面板任务（启动浏览器→登录检查→运行脚本→收工）\n"
               "  --update-script     手动把签到脚本更新到商店最新版（浏览器没在跑会临时拉起）\n"
+              "  --update-ext        手动把脚本猫扩展插件更新到最新（磁盘新版/商店）\n"
               "  --install-script    重新安装/修复脚本猫扩展 + 脚本 + Cookie 授权\n"
               "  --script-status     查看各账号已装脚本版本")
         sys.exit(0)
     if any(a in ("--update-script", "--update-scripts") for a in _argv):
         sys.exit(_cli_update_scripts(install=False))
+    if any(a in ("--update-ext", "--update-extension") for a in _argv):
+        sys.exit(_cli_update_ext())
     if "--install-script" in _argv:
         sys.exit(_cli_update_scripts(install=True))
     if "--script-status" in _argv:

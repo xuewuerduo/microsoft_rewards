@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      0.73
+// @version      0.74
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；已适配 zy 版逻辑（每日随机排程、中文热搜、llq.py 上报、多账号 CDP 端口）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -11484,29 +11484,26 @@ const __scBgKeepAlive = (function() {
             /* 不是 cron 叫醒的：脚本刚被启用、或被重新加载，等价于新会话 */
             const offGrid = this.wakeIsOffGrid(now);
             /* 上一轮还挂着 running，但它的心跳早就不刷了：可能真的没了，也可能只是
-               被 Chrome 冻结了（冻结时 setInterval 一起停）。粗筛命中后实测两个心跳
-               周期 —— runAlive 在涨就说明它还活着，绝不能清它的锁。 */
+               被 Chrome 冻结了（冻结时 setInterval 一起停）。
+               ⚠ 这里只做**粗筛**，不探活、不清锁：这段代码在「每分钟一次的空敲门」
+               里也会走到，而探活要干等两个心跳周期（~42 秒）。之前正是在这里
+               探活 + resetRoundState，把还在跑的那一轮锁清掉、缓存清空，接着报
+               「补跑已用满，等下一个执行点」——那一轮的工作就白丢了。
+               真死没死，留到确实要用的时候再确认（⑥a' 的补跑判定 / ⑦ 的让路判断）。 */
             let ownerProbedAlive = null;      // null=没测 / true=实测还活着
-            let ownerDead = this.deadOwner(now);
-            if (ownerDead) {
-                try { ownerProbedAlive = await this.probeOwnerAlive(); } catch (_) { ownerProbedAlive = false; }
-                if (ownerProbedAlive) {
-                    ownerDead = false;
-                    /* 探活花掉 ~42 秒，后面所有「现在几点」的判断都要用最新时刻，
-                       否则刚过点的执行点会被漏掉、heartbeatAt 也会写回 42 秒前。 */
-                    now = Date.now();
-                    this.startedAt = now;
-                }
-            }
+            let ownerDead = this.deadOwner(now);   // 粗筛结果，尚未验证
+            /* 粗筛那一刻「上一轮最后一次动弹」的时刻：后面 ② 的 reapDeadRound 可能先把
+               记录回收掉，等到 ⑥a' 再读就只剩 null，日志会变成「已安静 0 分钟」。 */
+            const ownerSnap = this.getState() || {};
+            const ownerLastAct = Math.max(Number(ownerSnap.at) || 0, Number(ownerSnap.aliveAt) || 0);
             /* 距上次「敲门」不到 FRESH_STAMP_MS：正常敲门间隔 = cron 周期（60 秒），
                短到这份上只能是停用→启用时的立即执行。只看 hbAt，不看 lastRun。 */
             const justLoaded = hbAt > 0 && (now - hbAt) < FRESH_STAMP_MS;
-            if (bootChanged || offlineLong || offGrid || ownerDead || justLoaded) {
+            if (bootChanged || offlineLong || offGrid || justLoaded) {
                 let why = "";
                 if (bootChanged) why = "浏览器重启过";
                 else if (offGrid) why = "脚本刚启用或重新加载（非定时唤醒）";
                 else if (justLoaded) why = `脚本刚被重新启用（距上次敲门 ${Math.round((now - hbAt) / 1000)} 秒）`;
-                else if (ownerDead) why = "上一轮跑到一半上下文被销毁";
                 else why = `距上次唤醒 ${Math.round(gapMs / 60000)} 分钟（上次 ${this.fmt(prevAt)}）`;
                 /* 只有真留下痕迹才清、才打那行「新会话」日志：
                    浏览器开着、机器睡了几小时再醒，残留通常是空的，
@@ -11517,6 +11514,10 @@ const __scBgKeepAlive = (function() {
                     Utils.log("💤", `${why}，无残留可清，本轮照常继续（今日进度与排程保留）`);
                 }
             }
+            /* 上面只要认出「换会话了」（重启 / 脚本重新启用 / 睡了很久），本轮就从干净状态开跑，
+               上一轮即使真被打断也不必再补跑一次 —— 补跑是给「同一次会话里的意外中断」准备的，
+               两种情况都算补反而会白烧额度、还多打一条自相矛盾的日志。 */
+            if (bootChanged || offlineLong || offGrid || justLoaded) ownerDead = false;
             if (boot > 0) GM_setValue("Config.bootId", boot);
             GM_setValue("Config.heartbeatAt", now);
 
@@ -11596,12 +11597,51 @@ const __scBgKeepAlive = (function() {
                拿不到就用唤醒分布的固定区间。每个上下文只拉一次，失败留给下一次敲门重试。 */
             try { await this.ensureRunPlan(); } catch (_) {}
 
-            /* ⑥a' 上一轮跑到一半被打断（CDP 导航把页面顶掉 / 标签页被回收）：
+            /* ⑥b 排程门控（放在最前面，因为它最便宜）：
+               @crontab 每分钟叫醒一次，但只有「当前这一分钟正好是某个执行点」才真跑，
+               其余 99% 的敲门在这里微秒级返回 —— 不碰运行锁、不探活、不打日志。
+               peek（apply=false）只看不占：万一后面发现上一轮还在跑，这个点还能留到下一分钟。 */
+            let peek = this.hitWakePoint(now, false);
+
+            /* ⑥a' 上一轮跑到一半被打断（CDP 导航顶掉页面 / 标签页被回收 / 后台 SW 被回收）：
                那一轮停在哪就是哪，剩下的任务全都还没做，而 tasks 的日期标记只写成功的
                —— 干等下一个执行点等于白丢 1/9 的配额。这里允许当场补跑，
-               每天限 RECOVER_MAX_PER_DAY 次，防止上下文反复崩时变成不停重跑。 */
+               每天限 RECOVER_MAX_PER_DAY 次，防止上下文反复崩时变成不停重跑。
+
+               ⚠ 只在「非执行点的空档」才做，原因有三：
+                 1) 探活要干等两个心跳周期（~42 秒），执行点命中时 ⑦ 本来就会探一次，
+                    没必要每分钟付一次这个钱；
+                 2) 空敲门的结论不该改动运行状态 —— 之前就是在空敲门里判死 + 清锁，
+                    把还在跑的那一轮锁清掉，然后报「补跑已用满」；
+                 3) 执行点命中时，⑦「上一轮还在跑就让路」的语义才是对的。 */
+            if (!peek.hit && ownerDead) {
+                /* 粗筛只是「4 分钟没心跳」，MV3 后台被冻结时同样成立（冻结连
+                   setInterval 一起停），所以必须实测：runAlive 在涨 = 它还活着。 */
+                try { ownerProbedAlive = await this.probeOwnerAlive(); } catch (_) { ownerProbedAlive = false; }
+                if (ownerProbedAlive) {
+                    ownerDead = false;
+                } else {
+                    /* 探活没回应 ≠ 死了（上下文之间 runAlive 的传递有延迟）：
+                       1 分钟内还有活动就按「仍在跑」处理，与 ⑦ 同一口径。 */
+                    const s1 = this.getState() || {};
+                    const lastAct1 = Math.max(Number(s1.at) || 0, Number(s1.aliveAt) || 0);
+                    if (lastAct1 > 0 && (Date.now() - lastAct1) < 60 * 1000) ownerDead = false;
+                }
+                /* 探活花掉 ~42 秒：后面所有「现在几点」的判断都要用最新时刻，
+                   否则刚过点的执行点会被漏掉、排程也会算错一档。 */
+                now = Date.now();
+                this.startedAt = now;
+                peek = this.hitWakePoint(now, false);
+            }
             let recover = false;
-            if (ownerDead) {
+            if (!peek.hit && ownerDead) {
+                const quietMin = ownerLastAct > 0 ? Math.max(1, Math.round((Date.now() - ownerLastAct) / 60000)) : 0;
+                /* ② 的 reapDeadRound 可能已经把这条死记录回收了，那就只剩补跑；
+                   还有残留才需要清一遍，避免打出「已安静 0 分钟」这种假日志。 */
+                if (this.getState() || Utils.lockInfo("Config.runLock")) {
+                    this.resetRoundState(`上一轮跑到一半上下文被销毁（已安静 ${quietMin} 分钟）：`
+                        + `运行锁与缓存已重置，今日进度与排程保留`);
+                }
                 const rDay = Number(GM_getValue("Config.recoverDay", 0)) || 0;
                 const rUsed = rDay === todayNum ? (Number(GM_getValue("Config.recoverCount", 0)) || 0) : 0;
                 if (rUsed < RECOVER_MAX_PER_DAY) {
@@ -11639,11 +11679,6 @@ const __scBgKeepAlive = (function() {
                 } catch (_) {}
             }
 
-            /* ⑥b 排程门控（放在最前面，因为它最便宜）：
-               @crontab 每分钟叫醒一次，但只有「当前这一分钟正好是某个执行点」才真跑，
-               其余 99% 的敲门在这里微秒级返回 —— 不碰运行锁、不探活、不打日志。
-               peek（apply=false）只看不占：万一后面发现上一轮还在跑，这个点还能留到下一分钟。 */
-            const peek = this.hitWakePoint(now, false);
             if (!peek.hit && !recover && !finaleCatchup) {
                 const nx = this.nextWakeAt(now);
                 /* ⚠ 只有「当下没有一轮在跑」时才写 waiting。
@@ -11674,6 +11709,9 @@ const __scBgKeepAlive = (function() {
                 const alive = ownerProbedAlive === true
                     ? true
                     : await this.probeOwnerAlive().catch(() => false);
+                /* 探活等了两轮心跳，now 必须跟上：否则下面「X 分钟前」会算大，
+                   让掉执行点时也会按旧分钟去标记。 */
+                now = Date.now();
                 if (alive) {
                     /* 上一轮还活着：把这个执行点让掉（标记已用），
                        否则每分钟都会走到这里再探活一次。 */
