@@ -23,10 +23,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))          # tools/
 ROOT = os.path.dirname(HERE)                               # 仓库根目录
 sys.path.insert(0, HERE)
 
-# 仓库里脚本的文件名（与脚本头 @name 一致，2026-11-23 定名，放仓库根目录）
+# 仓库里脚本的文件名（2026-11-23 定名，放仓库根目录）
 # 旧名按优先级保留兜底，兼容还没同步改名的分支/clone
-SCRIPT_FILE = "微软积分（优化版）.user.js"
-SCRIPT_FILE_LEGACY = ("microsoft-rewards.user.js", "zy.js")
+SCRIPT_FILE = "microsoft-rewards.user.js"
+SCRIPT_FILE_LEGACY = ("微软积分（优化版）.user.js", "zy.js")
 
 
 def script_path(name=None):

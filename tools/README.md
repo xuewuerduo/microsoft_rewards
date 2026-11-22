@@ -8,9 +8,8 @@
 
 ```
 .
-├── 微软积分（优化版）.user.js        ← 脚本源码（@version 是唯一版本来源）
-├── .gitattributes  .gitignore       ← Git 专用文件，必须留在根目录
-├── .gitea/workflows/sync-store.yml  ← Gitea Actions 专用路径，必须留在根目录
+├── microsoft-rewards.user.js   ← 脚本源码（@version 是唯一版本来源）
+├── .gitattributes  .gitignore  ← Git 专用文件，必须留在根目录
 └── tools/
     ├── zy.py            容器里的调度器：拉起多账号浏览器、写运行计划、挂日志采集、启动时校准脚本版本
     ├── sc_deploy.py     脚本猫部署工具（装扩展、装脚本、授权 Cookie、更新版本）
@@ -26,7 +25,7 @@
 ## 发布链路
 
 ```
-本地改 微软积分（优化版）.user.js（记得改 @version）
+本地改 microsoft-rewards.user.js（记得改 @version）
         ↓
 本地执行 tools/sc_sync.py --push --url <webhook>
         ↓ 读根目录的 user.js + tools/release-notes/v<版本>.md
@@ -37,7 +36,7 @@ tools/zy.py 的启动校准：已装 vX < 商店 vY → 自动更新 4 个账号
 
 ### 发版方式（本地 webhook，不依赖 CI）
 
-本环境没有 act_runner，`.gitea/workflows/sync-store.yml` 只保留手动入口、**不会被 push 触发**。
+本环境没有 act_runner，Gitea 工作流文件已删除，**发版不依赖任何 CI/push 触发**。
 发版统一走本地命令：
 
 ```bash
@@ -52,7 +51,7 @@ webhook 地址：登录 <https://scriptcat.org> → 用户设置里拿（形如
 ### 每次发版的固定动作
 
 ```bash
-# 1. 改根目录的 微软积分（优化版）.user.js，把头部 @version 0.73 → 0.74
+# 1. 改根目录的 microsoft-rewards.user.js，把头部 @version 0.73 → 0.74
 # 2. 写更新说明
 #    tools/release-notes/v0.74.md（商店页面用这个，短）
 #    tools/CHANGELOG.md 追加一节（完整版，含根因/验证方法）
@@ -71,7 +70,7 @@ python tools/sc_sync.py --push --dry --url <webhook地址>   # 演练，不提�
 
 ## 版本约定
 
-- `微软积分（优化版）.user.js` 头部 `@version` 是唯一版本号，改代码必须同时改它，否则商店不会生成新版本。
+- `microsoft-rewards.user.js` 头部 `@version` 是唯一版本号，改代码必须同时改它，否则商店不会生成新版本。
 - 线上比本地新时不要强推（`--force` 只在需要覆盖时用）。
 
 ## 授权说明

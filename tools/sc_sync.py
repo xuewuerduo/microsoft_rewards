@@ -18,11 +18,11 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))          # tools/
 ROOT = os.path.dirname(HERE)                               # 仓库根目录
 
-# 仓库里脚本的文件名（与脚本头 @name 一致，方便在 Gitea 页面直接点安装）。
-# 2026-11-23 定名：微软积分（优化版）.user.js，放在仓库根目录。
+# 仓库里脚本的文件名，放在仓库根目录。
+# 2026-11-23 定名：microsoft-rewards.user.js。
 # 旧名按优先级保留兜底：在还没同步这次改名的分支/clone 上跑也能找到文件。
-SCRIPT_FILE = "微软积分（优化版）.user.js"
-SCRIPT_FILE_LEGACY = ("microsoft-rewards.user.js", "zy.js")
+SCRIPT_FILE = "microsoft-rewards.user.js"
+SCRIPT_FILE_LEGACY = ("微软积分（优化版）.user.js", "zy.js")
 
 
 def script_path(name=None):
