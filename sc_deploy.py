@@ -54,19 +54,23 @@ sc_deploy.py — 脚本猫（ScriptCat）扩展 + 商店脚本「一键部署 / 
 """
 
 import argparse
+import atexit
 import base64
 import hashlib
 import json
 import os
 import re
+import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, quote
 
@@ -904,6 +908,600 @@ def disk_ext_version(ext_dir):
         return ""
 
 
+def _ver_cmp(a, b):
+    """比较两个版本号：a<b 返回 -1，相等 0，a>b 返回 1；有解析不出来的返回 None。
+    "1.4" 与 "1.4.0" 视为相等（缺位补 0），否则会被误判成「落后」。"""
+    ta, tb = _ver_tuple(a), _ver_tuple(b)
+    if ta is None or tb is None:
+        return None
+    n = max(len(ta), len(tb))
+    ta = ta + (0,) * (n - len(ta))
+    tb = tb + (0,) * (n - len(tb))
+    return (ta > tb) - (ta < tb)
+
+
+# ═══════════════ 线上最新版（脚本猫官方发布源）═══════════════
+# 为什么必须有这一段：
+#   旧逻辑只比对「浏览器里已装版本 vs 磁盘解包目录版本」。容器镜像里带的解包目录
+#   本身就是 1.4.0，两份都是 1.4.0 → 永远得出「已是最新 v1.4.0」，而线上早就 1.5.2。
+#   等于拿本地副本当标尺自我确认，判断不出落后。线上最新版必须去发布源查。
+SC_EXT_REPO = (os.getenv("SC_EXT_REPO", "scriptscat/scriptcat") or "scriptscat/scriptcat").strip()
+SC_EXT_LATEST_TTL = int(os.getenv("SC_EXT_LATEST_TTL", "1800"))       # 缓存 30 分钟
+SC_EXT_AUTOINSTALL = (os.getenv("SC_EXT_AUTOINSTALL", "1").strip().lower()
+                      not in ("0", "false", "no", "off"))
+SC_EXT_PKG_MAX = 200 * 1024 * 1024
+
+_EXT_LATEST_MEM = {"at": 0.0, "data": None}
+_EXT_LATEST_LOCK = threading.Lock()
+
+
+def _ext_latest_cache_file():
+    try:
+        return os.path.join(HERE, ".sc-ext-latest.json")
+    except Exception:
+        return ""
+
+
+def _ext_latest_cache_read():
+    p = _ext_latest_cache_file()
+    if not p or not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) and d.get("version") else None
+    except Exception:
+        return None
+
+
+def _ext_latest_cache_write(d):
+    p = _ext_latest_cache_file()
+    if not p:
+        return
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+        os.replace(tmp, p)
+    except Exception:
+        pass          # 缓存写不进去（只读挂载）不影响功能
+
+
+def _http_get(url, timeout=20, limit=None):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UA,
+        "Accept": "application/vnd.github+json, application/octet-stream, */*",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        if limit:
+            data = r.read(limit)
+        else:
+            data = r.read()
+    return data
+
+
+# ── GitHub 下载加速站 ─────────────────────────────────────────
+# 容器在国内出口直连 github.com 下载 5MB 的扩展包经常超时/断流，走加速站稳得多。
+# 用法是把原地址整体拼在前缀后面：https://ghfast.top/https://github.com/...
+# 配置：SC_EXT_MIRROR="前缀1,前缀2,..."；置空或 off 则只直连。
+SC_EXT_MIRROR = os.getenv(
+    "SC_EXT_MIRROR",
+    "https://ghfast.top/,https://ghproxy.net/,https://gh-proxy.com/",
+).strip()
+
+
+def _ext_mirrors():
+    if SC_EXT_MIRROR.lower() in ("", "0", "off", "none", "false", "no"):
+        return []
+    out = []
+    for s in re.split(r"[,;\s]+", SC_EXT_MIRROR):
+        s = s.strip()
+        if not s:
+            continue
+        out.append(s if s.endswith("/") else s + "/")
+    return out
+
+
+def _mirror_urls(url):
+    """GitHub 资产地址 → [加速站地址..., 原始地址]。非 GitHub 域名不加前缀。"""
+    u = str(url or "")
+    if not u:
+        return []
+    is_gh = u.startswith("https://github.com/") or "githubusercontent.com" in u
+    if not is_gh:
+        return [u]
+    return [m + u for m in _ext_mirrors()] + [u]
+
+
+def _download_file(url, dest, timeout=90, limit=SC_EXT_PKG_MAX, log=None, validator=None):
+    """下载 GitHub 资产：先走加速站，失败再直连。返回 (ok, used_url, msg)。"""
+    cands = _mirror_urls(url)
+    if not cands:
+        return False, "", "没有可用的下载地址"
+    last = ""
+    for u in cands:
+        host = urllib.parse.urlparse(u).netloc or u
+        try:
+            data = _http_get(u, timeout=timeout, limit=limit)
+            if not data:
+                last = "空响应"
+                raise ValueError(last)
+            with open(dest, "wb") as f:
+                f.write(data)
+            if validator and not validator(dest):
+                last = "内容校验未通过（可能是加速站错误页）"
+                raise ValueError(last)
+            if log:
+                log("    · 下载通道：%s（%.1f MB）"
+                    % ("直连 GitHub" if u == url else host, len(data) / 1048576.0))
+            return True, u, ""
+        except Exception as e:
+            last = "%s: %s" % (type(e).__name__, e)
+            if log:
+                log("    · 通道 %s 不可用（%s），换下一个…" % (host, last))
+    return False, "", last or "全部通道失败"
+
+
+_PKG_LOCK = threading.Lock()
+_PKG_CACHE = {}          # 下载地址 → 本地包路径（同一进程 4 个账号只下 1 次）
+_PKG_DIR = []
+
+
+def _pkg_cache_dir():
+    if not _PKG_DIR:
+        d = tempfile.mkdtemp(prefix="sc-ext-pkg-")
+        _PKG_DIR.append(d)
+
+        def _clean():
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+        atexit.register(_clean)
+    return _PKG_DIR[0]
+
+
+def prefetch_ext_zip(zip_url, timeout=180, log=None):
+    """预热安装包：后台把官方 chrome.zip 下到进程内缓存，只下不下装。
+
+    用来把 5MB 的下载摊到「部署第 2~4 个账号」那几十秒里 —— 等真正要装的时候
+    `_shared_pkg()` 命中缓存，解包 + reload 只要几秒。
+    失败不抛：下载失败时安装阶段会照常再试一次。
+    """
+    if not zip_url:
+        return False
+    try:
+        p, _msg = _shared_pkg(zip_url, timeout=timeout, log=log)
+        return bool(p)
+    except Exception:
+        return False
+
+
+def _shared_pkg(url, timeout=180, log=None):
+    """同一进程内多个账号共用一个安装包：第一个人下载，其余等它下完直接用。
+
+    4 个账号并发校准时若各下 5MB，既慢又容易被加速站限速/断流。
+    返回 (本地路径, 错误信息)。
+    """
+    with _PKG_LOCK:
+        p = _PKG_CACHE.get(url)
+        if p and os.path.exists(p):
+            if log:
+                log("    · 复用已下载的安装包（其他账号刚下完）")
+            return p, ""
+        path = os.path.join(_pkg_cache_dir(), "pkg.zip")
+        good, _u, msg = _download_file(url, path, timeout=timeout,
+                                       validator=zipfile.is_zipfile, log=log)
+        if not good:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+            return "", msg
+        _PKG_CACHE[url] = path
+        return path, ""
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """不跟随 3xx：只为读 Location（releases/latest 指向的 tag）。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _http_location(url, timeout=15):
+    """返回 3xx 的 Location（不跟随跳转）；取不到返回空串。"""
+    import urllib.error
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    try:
+        opener.open(req, timeout=timeout).close()
+        return ""
+    except urllib.error.HTTPError as e:
+        if 300 <= int(e.code) < 400:
+            return str(e.headers.get("Location") or "")
+        raise
+
+
+def _url_ok(url, timeout=10):
+    """HEAD 探一下资产地址是否真的存在（只是挑名字，不下载内容）。"""
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return 200 <= int(getattr(r, "status", 0) or 0) < 300
+    except Exception:
+        return False
+
+
+def _gh_release_by_redirect(timeout=20, log=None):
+    """api.github.com 不通时的兜底：用网页跳转拿最新 tag + 真实资产名。
+
+    容器在国内出口经常拿不到 api.github.com（Cloudflare 403 / 限流），
+    但 github.com 的网页跳转通常能过：
+      /releases/latest                → 302 → /releases/tag/v1.5.2
+      /releases/expanded_assets/<tag> → HTML 里列出真实资产名
+                                        （scriptcat-1.5.2-chrome.zip，别猜，猜错就 404）
+    返回和 ext_latest 同样的结构；失败抛异常由调用方接。
+    """
+    loc = _http_location("https://github.com/%s/releases/latest" % SC_EXT_REPO,
+                         timeout=timeout)
+    m = re.search(r"/releases/tag/([^/?#]+)", loc or "")
+    if not m:
+        raise ValueError("releases/latest 没有跳到 tag（Location=%r）" % (loc or ""))
+    tag = urllib.parse.unquote(m.group(1))
+    vt = _ver_tuple(tag)
+    if not vt:
+        raise ValueError("tag 版本号解析失败：%r" % tag)
+    ver = ".".join(str(x) for x in vt)
+    base = "https://github.com/%s/releases/download/%s/" % (SC_EXT_REPO, tag)
+    zip_url = crx_url = ""
+    try:
+        html = _http_get("https://github.com/%s/releases/expanded_assets/%s"
+                         % (SC_EXT_REPO, quote(tag, safe="")),
+                         timeout=timeout).decode("utf-8", "replace")
+        for n in re.findall(r'href="[^"]*?/([^"/]+\.(?:zip|crx))"', html):
+            low = n.lower()
+            if low.endswith(".zip") and "chrome" in low and not zip_url:
+                zip_url = base + n
+            elif low.endswith(".crx") and "chrome" in low and not crx_url:
+                crx_url = base + n
+    except Exception:
+        pass
+    if not zip_url:
+        # 官方资产名带 v 前缀（实测 scriptcat-v1.5.2-chrome.zip），但不保证永远如此：
+        # 先试带 v，再试不带 v，能 HEAD 通的才用，避免拿着一个 404 去下载。
+        for cand in ("scriptcat-v%s-chrome.zip" % ver, "scriptcat-%s-chrome.zip" % ver):
+            if _url_ok(base + cand, timeout=timeout):
+                zip_url = base + cand
+                break
+    if not zip_url:
+        zip_url = base + "scriptcat-v%s-chrome.zip" % ver
+    if not crx_url:
+        crx_url = base + "scriptcat-v%s-chrome.crx" % ver
+    if log:
+        log("    · 用 github.com 跳转拿到最新版：%s → %s" % (tag, os.path.basename(zip_url)))
+    return {"version": ver, "tag": tag, "zip": zip_url, "crx": crx_url,
+            "source": "github-web", "at": time.time()}
+
+
+def ext_latest(force=False, timeout=20, log=None):
+    """查脚本猫「线上最新版」。
+
+    返回 {version, tag, zip, crx, source, at, stale}；查不到返回 {}。
+    来源：GitHub Releases（官方 CI 发布，含 scriptcat-<ver>-chrome.zip / .crx）。
+    缓存：进程内 + 落盘，默认 30 分钟 —— 4 个账号共用一个结果，避免被 API 限流。
+    网络失败时退回过期的落盘缓存（标 stale=True），总比没有标尺好。
+    """
+    now = time.time()
+    t_enter = now          # 进入时刻：等锁期间别人查回来的结果，即使 force 也直接复用
+    with _EXT_LATEST_LOCK:
+        mem = _EXT_LATEST_MEM
+        if mem["data"] and (mem["at"] >= t_enter
+                            or ((not force) and now - mem["at"] < SC_EXT_LATEST_TTL)):
+            return dict(mem["data"])
+
+    disk = _ext_latest_cache_read()
+    if (not force) and disk and time.time() - float(disk.get("at") or 0) < SC_EXT_LATEST_TTL:
+        with _EXT_LATEST_LOCK:
+            _EXT_LATEST_MEM["data"], _EXT_LATEST_MEM["at"] = disk, time.time()
+        return dict(disk)
+
+    # 整个查询 HTTP 过程都放在锁里：4 个账号是并发线程，不串起来会同时打 4 次 API
+    # （GitHub 未认证限流 60 次/小时/IP）。等锁的线程回来后再做一次缓存复查。
+    with _EXT_LATEST_LOCK:
+        mem = _EXT_LATEST_MEM
+        if mem["data"] and mem["at"] >= t_enter:
+            return dict(mem["data"])
+        now = time.time()
+        url = "https://api.github.com/repos/%s/releases/latest" % SC_EXT_REPO
+        try:
+            raw = _http_get(url, timeout=timeout)
+            d = json.loads(raw.decode("utf-8", "replace"))
+            tag = str(d.get("tag_name") or d.get("name") or "")
+            vt = _ver_tuple(tag)
+            if not vt:
+                raise ValueError("发布版本号解析失败：%r" % tag)
+            zip_url = crx_url = ""
+            for a in d.get("assets") or []:
+                name = str(a.get("name") or "").lower()
+                u = str(a.get("browser_download_url") or "")
+                if not u:
+                    continue
+                if name.endswith(".zip") and "chrome" in name and not zip_url:
+                    zip_url = u
+                elif name.endswith(".crx") and "chrome" in name and not crx_url:
+                    crx_url = u
+            data = {"version": ".".join(str(x) for x in vt), "tag": tag,
+                    "zip": zip_url, "crx": crx_url, "source": "github", "at": now}
+            _ext_latest_cache_write(data)
+            _EXT_LATEST_MEM["data"], _EXT_LATEST_MEM["at"] = dict(data), now
+            return data
+        except Exception as e:
+            if log:
+                log("    [!] api.github.com 查最新版失败（%s）：%s" % (SC_EXT_REPO, e))
+            # 通道 2：github.com 网页跳转。容器在国内出口经常拿不到 api（Cloudflare
+            # 403 / 未认证限流 60 次/小时/IP），但网页跳转基本能过 —— 只拿 tag 和资产名，
+            # 不消耗 API 配额。这条通道不通时才认为「真的查不到」。
+            try:
+                data = _gh_release_by_redirect(timeout=timeout, log=log)
+                _ext_latest_cache_write(data)
+                _EXT_LATEST_MEM["data"], _EXT_LATEST_MEM["at"] = dict(data), now
+                return data
+            except Exception as e2:
+                if log:
+                    log("    [!] github.com 网页兜底也失败：%s" % e2)
+            # 通道 3：显式钉版本（两条网络都废时用，SC_EXT_WANT_VERSION=1.5.2）
+            want = (os.getenv("SC_EXT_WANT_VERSION", "") or "").strip()
+            if want and _ver_tuple(want):
+                ver = ".".join(str(x) for x in _ver_tuple(want))
+                data = {
+                    "version": ver, "tag": "v" + ver,
+                    "zip": "https://github.com/%s/releases/download/v%s/scriptcat-v%s-chrome.zip"
+                           % (SC_EXT_REPO, ver, ver),
+                    "crx": "https://github.com/%s/releases/download/v%s/scriptcat-v%s-chrome.crx"
+                           % (SC_EXT_REPO, ver, ver),
+                    "source": "env", "at": now,
+                }
+                if log:
+                    log("    · 两条通道都不通，按 SC_EXT_WANT_VERSION 指定 v%s" % ver)
+                _EXT_LATEST_MEM["data"], _EXT_LATEST_MEM["at"] = dict(data), now
+                return data
+            cached = disk or _ext_latest_cache_read()
+            if cached:
+                cached = dict(cached)
+                cached["stale"] = True
+                if log:
+                    log("    · 用上次查到的线上版本 v%s（已过期，仅供参考）"
+                        % cached.get("version"))
+                _EXT_LATEST_MEM["data"], _EXT_LATEST_MEM["at"] = cached, now
+                return cached
+            return {}
+
+
+def _zip_prefix(zf):
+    """压缩包里 manifest.json 的前缀目录（官方包通常多套一层同名目录，也可能直接在根）。"""
+    names = [n.replace("\\", "/") for n in zf.namelist()]
+    cands = [n for n in names if n == "manifest.json" or n.endswith("/manifest.json")]
+    if not cands:
+        return None
+    best = min(cands, key=len)
+    return best[:-len("manifest.json")]        # 末尾带 "/" 或空串
+
+
+def _safe_extract(zf, dest, prefix):
+    base = os.path.abspath(dest)
+    for m in zf.infolist():
+        name = m.filename.replace("\\", "/")
+        if prefix:
+            if not name.startswith(prefix):
+                continue
+            name = name[len(prefix):]
+        name = name.strip("/")
+        if not name:
+            continue
+        parts = name.split("/")
+        if name.startswith("/") or ".." in parts:
+            raise ValueError("压缩包含非法路径：%s" % m.filename)
+        out = os.path.join(base, *parts)
+        if not os.path.abspath(out).startswith(base):
+            raise ValueError("压缩包含非法路径：%s" % m.filename)
+        if m.is_dir():
+            os.makedirs(out, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(out) or base, exist_ok=True)
+        with zf.open(m) as src, open(out, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+_EXT_DIR_LOCKS = {}
+_EXT_DIR_LOCKS_GUARD = threading.Lock()
+
+
+def _ext_dir_lock(ext_dir):
+    """同一个解包目录一把锁：4 个账号共用一份目录，不能同时解包（会互相覆盖）。"""
+    key = os.path.abspath(ext_dir or "")
+    with _EXT_DIR_LOCKS_GUARD:
+        lk = _EXT_DIR_LOCKS.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _EXT_DIR_LOCKS[key] = lk
+        return lk
+
+
+def install_ext_zip(ext_dir, zip_url, want_ver="", log=print, timeout=180):
+    """下载官方 chrome.zip 覆盖解包扩展目录。返回 (ok, msg)。
+
+    并发：4 个账号指向同一个解包目录，只让第一个真解包，其余账号拿到「已就绪」，
+    各自去 reload 自己的浏览器（每个浏览器进程要单独 reload 才读新文件）。
+    """
+    if not ext_dir:
+        return False, "没有解包扩展目录"
+    with _ext_dir_lock(ext_dir):
+        cur = disk_ext_version(ext_dir)
+        if want_ver and cur and _ver_cmp(cur, want_ver) == 0:
+            if log:
+                log("    · 扩展目录已是 v%s（另一个账号刚装完），跳过重复解包" % cur)
+            return True, ""
+        return _install_ext_zip_locked(ext_dir, zip_url, want_ver, log, timeout)
+
+
+def _install_ext_zip_locked(ext_dir, zip_url, want_ver="", log=print, timeout=180):
+    """install_ext_zip 的实做（调用方必须持有 _ext_dir_lock）。"""
+    if not ext_dir:
+        return False, "没有解包扩展目录"
+    if not zip_url:
+        return False, "官方包没有 chrome.zip 资产"
+    parent = os.path.dirname(os.path.abspath(ext_dir)) or "."
+    if not os.path.isdir(parent):
+        return False, "扩展目录的上级目录不存在：%s" % parent
+    try:                       # 真实写一次探测：os.access 在只读挂载 / Windows 上都不准
+        fd, probe = tempfile.mkstemp(prefix=".sc-w-", dir=parent)
+        os.close(fd)
+        os.remove(probe)
+    except Exception:
+        return False, ("扩展目录所在路径不可写：%s（镜像只读？把 SC_EXT_DIR 指到可写目录）"
+                       % parent)
+
+    pkg = ""
+    tmp_new = ""
+    try:
+        pkg, dmsg = _shared_pkg(zip_url, timeout=timeout, log=log)
+        if not pkg:
+            return False, "下载失败（%s）" % dmsg
+
+        # 先确保目录存在：原方案靠 rename 创建，改成原地换内容后要自己建。
+        if not os.path.isdir(ext_dir):
+            os.makedirs(ext_dir, exist_ok=True)
+
+        with zipfile.ZipFile(pkg) as zf:
+            prefix = _zip_prefix(zf)
+            if prefix is None:
+                return False, "官方包里找不到 manifest.json"
+            try:
+                mf = json.loads(zf.read(prefix + "manifest.json").decode("utf-8", "replace")) or {}
+            except Exception:
+                mf = {}
+            ver = str(mf.get("version") or "")
+            if want_ver and _ver_cmp(ver, want_ver) not in (0, 1):
+                return False, "包内版本 v%s 与线上最新 v%s 不符（包里没有新版？）" % (ver or "?", want_ver)
+
+            # 新内容解到 ext_dir **内部**的临时目录：见下面的注释，必须同设备。
+            stamp = int(time.time())
+            tmp_new = os.path.join(os.path.abspath(ext_dir), ".sc-new-%d" % stamp)
+            if os.path.exists(tmp_new):
+                shutil.rmtree(tmp_new, ignore_errors=True)
+            os.makedirs(tmp_new, exist_ok=True)
+            _safe_extract(zf, tmp_new, prefix)
+            if not os.path.exists(os.path.join(tmp_new, "manifest.json")):
+                return False, "解包后没有 manifest.json"
+
+        ok, msg = _swap_ext_dir(ext_dir, tmp_new, ver, log=log)
+        if ok:
+            tmp_new = ""          # 已被消费掉
+        return ok, msg
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+    finally:
+        # 安装包是进程内共享的（其他账号可能还要用），由 atexit 统一清理
+        try:
+            if tmp_new and os.path.exists(tmp_new):
+                shutil.rmtree(tmp_new, ignore_errors=True)
+        except Exception:
+            pass
+        # 只留最近一份备份，避免容器里越堆越多
+        try:
+            base = os.path.basename(ext_dir) + ".bak-"
+            sibs = sorted([d for d in os.listdir(parent) if d.startswith(base)],
+                          reverse=True)
+            for d in sibs[1:]:
+                shutil.rmtree(os.path.join(parent, d), ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _mv(src, dst):
+    """同设备用 rename（瞬时）；万一跨设备（EXDEV）退化成 copy+delete。
+
+    正常路径下 ext_dir 内部的移动都是同设备；这条兜底只针对
+    「ext_dir 里某个子目录自己又是一个挂载点」这种极端情况。
+    """
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        if getattr(e, "errno", None) != 18:      # 18 = EXDEV
+            raise
+        shutil.move(src, dst)
+
+
+def _swap_ext_dir(ext_dir, tmp_new, ver="", log=print):
+    """把 ext_dir 里的旧内容换成 tmp_new 里的新内容（**不 rename ext_dir 本身**）。
+
+    为什么不能整体换目录：容器里 `/app/extensions/scriptcat` 常常是单独挂载的卷
+    （docker volume / bind mount），它和上级 `/app/extensions` 不在同一设备上，
+    `os.rename(ext_dir, "<ext_dir>.bak-xxx")` 会直接失败：
+
+        OSError: [Errno 18] Cross-device link:
+        '/app/extensions/scriptcat' -> '/app/extensions/scriptcat.bak-1795358656'
+
+    线上 22:44:16 四个账号全撞这个错，扩展一直升不上去（下载明明成功了）。
+    改成就地换内容：旧内容挪到 `ext_dir/.sc-old-<ts>`、新内容从 `ext_dir/.sc-new-<ts>`
+    挪进来 —— 所有 rename 都在 ext_dir 内部完成，同一设备，绝不会 EXDEV。
+    任一步失败都把旧内容挪回去，目录不会变成半截状态。
+    """
+    ext_dir = os.path.abspath(ext_dir)
+    stamp = int(time.time())
+    olddir = os.path.join(ext_dir, ".sc-old-%d" % stamp)
+    keep = {os.path.basename(tmp_new), os.path.basename(olddir)}
+
+    # 上次中断遗留的临时目录先清掉（Chrome 只认 manifest.json，多几个隐藏目录无害，
+    # 但攒着占空间、也会拖慢目录遍历）
+    for d in os.listdir(ext_dir):
+        if d.startswith(".sc-new-") or d.startswith(".sc-old-"):
+            if d != os.path.basename(tmp_new):
+                shutil.rmtree(os.path.join(ext_dir, d), ignore_errors=True)
+
+    old_ver = disk_ext_version(ext_dir) or "?"
+    os.makedirs(olddir, exist_ok=True)
+    moved = []
+    try:
+        for item in os.listdir(ext_dir):
+            if item in keep:
+                continue
+            _mv(os.path.join(ext_dir, item), os.path.join(olddir, item))
+            moved.append(item)
+        new_items = [i for i in os.listdir(tmp_new)]
+        for item in new_items:
+            _mv(os.path.join(tmp_new, item), os.path.join(ext_dir, item))
+    except Exception:
+        # 回滚：清掉已经搬进来的新文件，再把旧的搬回去
+        for item in os.listdir(ext_dir):
+            if item in keep:
+                continue
+            p = os.path.join(ext_dir, item)
+            try:
+                shutil.rmtree(p) if os.path.isdir(p) else os.remove(p)
+            except Exception:
+                pass
+        for item in moved:
+            try:
+                _mv(os.path.join(olddir, item), os.path.join(ext_dir, item))
+            except Exception:
+                pass
+        shutil.rmtree(olddir, ignore_errors=True)
+        raise
+
+    try:
+        os.rmdir(tmp_new)
+    except Exception:
+        shutil.rmtree(tmp_new, ignore_errors=True)
+    shutil.rmtree(olddir, ignore_errors=True)
+    if log:
+        log("    · 已覆盖解包目录（就地替换，不移动挂载点）：v%s → v%s"
+            % (old_ver, disk_ext_version(ext_dir) or ver or "?"))
+    return True, ver
+
+
 _AUTO_UPDATE_JS = r"""(function(){return new Promise(function(res){
   var dp = (typeof chrome !== 'undefined') ? chrome.developerPrivate : null;
   if (!dp || !dp.autoUpdate) return res(JSON.stringify({ok:false, err:"没有 autoUpdate"}));
@@ -929,53 +1527,183 @@ def auto_update_ext(port, log=None):
         sess.close()
 
 
-def ensure_ext_current(port, ext_id, ext_dir=None, allow_store=True, log=print):
-    """把已加载的脚本猫扩展对齐到「磁盘上那份」或商店最新。只 reload，不重启浏览器。
+def _wait_ext_version(port, ext_id, want="", tries=6, gap=1.5, log=None):
+    """reload / 商店更新后轮询等版本落定（Chrome 更新是异步的，立刻读常常还是旧值）。"""
+    cur = ""
+    for i in range(max(1, tries)):
+        cur = str(ext_info(port, ext_id, log=log).get("version") or "")
+        if cur and (not want or _ver_cmp(cur, want) in (0, 1)):
+            return cur
+        time.sleep(gap)
+    return cur
 
-    · 磁盘解包目录版本更高 → reload 让 Chrome 重读文件（同路径同 ID，脚本与授权都不丢）
-    · 版本相同            → 什么都不做
-    · 磁盘版本更低        → 保留浏览器里的（避免把开发版顶回旧版）
-    · 没有磁盘目录（商店 CRX）→ 点一次「更新」让商店自己拉
-    返回 {ok, changed, before, after, source}
+
+def prepare_ext_dir(ext_dir, log=print, force=True, timeout=180):
+    """启动预检：把「本地解包目录」直接对齐到 GitHub 最新版 —— **不涉及任何浏览器**。
+
+    与 ensure_ext_current 的分工（2026-11-22 起的两段式）：
+      · 本函数（第一段，浏览器还没起来）：查线上最新 → 本地目录落后就走加速站
+        下载 chrome.zip、就地解包覆盖。/app/extensions/scriptcat 是挂载点，
+        覆盖走 _swap_ext_dir（不 rename 目录本身，不会 EXDEV）。
+      · _ext_sync_local / ensure_ext_current（第二段，浏览器已起来）：只把「已装版本」
+        对齐到这份本地目录，reload 一次即可。
+
+    这样做的原因：以前是「谁先起来谁去 GitHub 查 + 顺手下 5MB」，4 个账号各查一遍、
+    下载挤在开跑前后（实测下载 22~65 秒），日志里「提示升级」要等到 100 秒后才出现。
+
+    返回 {ok, changed, before, after, latest, verified, zip, stale, note}
+    ok=True 表示「本地目录现在就是线上最新（或比线上更新）」；查不到线上版本时
+    ok 只代表「本地目录可用」，verified=False —— 调用方不许据此说「已是最新」。
     """
-    res = {"ok": False, "changed": False, "before": "", "after": "", "source": ""}
-    before = str(ext_info(port, ext_id, log=log).get("version") or "")
+    res = {"ok": False, "changed": False, "before": "", "after": "", "latest": "",
+           "verified": False, "zip": "", "stale": False, "note": ""}
+    if not ext_dir:
+        res["note"] = "没有解包扩展目录"
+        return res
+    before = disk_ext_version(ext_dir)
     res["before"] = res["after"] = before
+
+    latest = ext_latest(force=force, log=log) or {}
+    lv = str(latest.get("version") or "")
+    res["latest"] = lv
+    res["zip"] = str(latest.get("zip") or "")
+    res["stale"] = bool(latest.get("stale"))
+    res["verified"] = bool(lv) and not res["stale"]
+    if not lv:
+        res["note"] = "线上最新版没取到（网络/发布源不可用）"
+        res["ok"] = bool(before)
+        return res
+
+    cmp = _ver_cmp(before, lv) if before else -1
+    if cmp is not None and cmp >= 0:
+        res["ok"] = True
+        if cmp == 1:
+            res["note"] = "本地 v%s 比线上 v%s 新（本地开发版），保留" % (before, lv)
+        return res
+
+    if not res["zip"]:
+        res["note"] = "线上最新 v%s 没有 chrome.zip 资产" % lv
+        return res
+    if not SC_EXT_AUTOINSTALL:
+        res["note"] = "SC_EXT_AUTOINSTALL 已关闭，不自动下载"
+        return res
+
+    log("    · 本地 v%s → 线上最新 v%s，开始下载并解包（加速站）…"
+        % (before or "无扩展", lv))
+    good, msg = install_ext_zip(ext_dir, res["zip"], want_ver=lv, log=log, timeout=timeout)
+    after = disk_ext_version(ext_dir)
+    res["after"] = after or before
+    if not good:
+        res["note"] = msg
+        return res
+    res["changed"] = bool(after) and (not before or _ver_cmp(after, before) == 1)
+    res["ok"] = bool(after) and _ver_cmp(after, lv) in (0, 1)
+    if not res["ok"]:
+        res["note"] = "解包后版本 v%s 仍不是 v%s" % (after or "?", lv)
+    return res
+
+
+def ensure_ext_current(port, ext_id, ext_dir=None, allow_store=True, log=print,
+                       want_latest=True, auto_install=None, force_latest=False):
+    """把已加载的脚本猫扩展对齐到「线上最新版」。只 reload，不重启浏览器。
+
+    ★ 判定基准（这次修的关键）：线上最新版去官方发布源查，**不再拿磁盘里那份当标尺**。
+      旧逻辑只比「已装 vs 磁盘解包目录」，而容器镜像自带的解包目录本身就是 1.4.0，
+      两份都是 1.4.0 → 永远输出「已是最新 v1.4.0」，哪怕线上早就是 1.5.2。
+
+    流程：
+      ① 已装 < 线上最新 → 下载官方 chrome.zip 覆盖解包目录 + reload（同路径同 ID，脚本与授权都在）；
+         解包通道不可用时退回商店 autoUpdate，并轮询等版本落定
+      ② 已装 ≥ 线上最新 → 才算「最新」；磁盘目录若更新（本地开发版）仍 reload 一次
+      ③ 查不到线上版本 → 退回磁盘比对，但 verified=False，调用方**不许**说「已是最新」
+
+    返回 {ok, changed, before, after, latest, verified, source, action, note}
+    """
+    if auto_install is None:
+        auto_install = SC_EXT_AUTOINSTALL
+    res = {"ok": False, "changed": False, "before": "", "after": "", "latest": "",
+           "verified": False, "source": "", "action": "", "note": ""}
+
+    info = ext_info(port, ext_id, log=log)
+    before = str(info.get("version") or "")
+    res["before"] = res["after"] = before
+    loc = str(info.get("location") or "")
     disk = disk_ext_version(ext_dir)
-    if disk:
-        res["source"] = "disk"
-        dt, bt = _ver_tuple(disk), _ver_tuple(before)
-        if bt is not None and dt is not None and dt <= bt:
-            res["ok"] = True
-            return res
-        log("    · 磁盘扩展 v%s，浏览器里是 v%s → 重载让 Chrome 读新文件…" % (disk, before or "?"))
-        if not reload_ext(port, ext_id, log=log):
-            return res
-    elif allow_store:
-        res["source"] = "store"
-        if not auto_update_ext(port, log=log):
-            log("    · 商店更新未受理（解包扩展没有更新源，或网络不通）")
-            res["ok"] = True          # 不是错误：本来就没有商店通道
-            return res
-        time.sleep(3.0)
-    else:
+
+    latest = ext_latest(force=force_latest, log=log) if want_latest else {}
+    lv = str((latest or {}).get("version") or "")
+    if lv:
+        res["latest"] = lv
+        res["verified"] = True
+
+    after = before
+    # ── ① 已装落后线上最新 → 升级 ─────────────────────────────
+    if before and lv and _ver_cmp(before, lv) == -1:
+        res["action"] = "upgrade"
+        log("    · 已装 v%s，线上最新 v%s → 落后，开始升级" % (before, lv))
+        ok = False
+        if auto_install and ext_dir and latest.get("zip") and (loc in ("", "UNPACKED") or disk):
+            good, msg = install_ext_zip(ext_dir, latest["zip"], want_ver=lv, log=log)
+            if good:
+                ok = True
+                res["source"] = "github"
+                reload_ext(port, ext_id, log=log)
+                after = _wait_ext_version(port, ext_id, want=lv, log=log)
+                log("    · 覆盖并重载完成：浏览器里 v%s" % (after or "?"))
+            else:
+                res["note"] = msg
+                log("    [!] 解包通道升级失败：%s" % msg)
+        # 解包通道走不通（没有目录 / 目录只读 / 是商店 CRX）→ 点商店更新
+        if not ok and allow_store:
+            if auto_update_ext(port, log=log):
+                res["source"] = res["source"] or "store"
+                after = _wait_ext_version(port, ext_id, want=lv, tries=10, gap=2.0, log=log)
+                if after and _ver_cmp(after, before) == 1:
+                    ok = True
+                else:
+                    res["note"] = res["note"] or "商店更新未在 20 秒内生效"
+            else:
+                res["note"] = res["note"] or "商店更新未受理（解包扩展没有商店更新源）"
+        if not ok and not res["note"]:
+            res["note"] = "自动升级失败"
+        if ok and after and _ver_cmp(after, lv) not in (0, 1):
+            ok = False
+            res["note"] = "升级后版本仍是 v%s，未达到 v%s" % (after, lv)
+        res["ok"] = ok
+        res["after"] = after or before
+        res["changed"] = bool(after and before and _ver_cmp(after, before) == 1)
+        return res
+
+    # ── ② 已装 ≥ 线上最新（或线上版本未知，退回磁盘比对）─────────
+    if res["verified"]:
+        res["action"] = "none"
+        # 本地解包目录比已装更新（自己换过目录）→ reload 一次让 Chrome 读新文件
+        if disk and before and _ver_cmp(disk, before) == 1:
+            log("    · 磁盘扩展 v%s 比已装 v%s 新 → 重载让 Chrome 读新文件…" % (disk, before))
+            if reload_ext(port, ext_id, log=log):
+                after = _wait_ext_version(port, ext_id, log=log)
+                res["source"] = "disk"
+                res["changed"] = bool(after and before and _ver_cmp(after, before) == 1)
+        res["after"] = after or before
         res["ok"] = True
         return res
 
-    time.sleep(1.0)
-    after = str(ext_info(port, ext_id, log=log).get("version") or "")
-    # reload 了但版本没变：说明浏览器里这份扩展不是从该解包目录加载的（商店 CRX 装的），
-    # 此时退回「商店更新」再试一次，避免把「reload 无效」误报成「已是最新」。
-    if disk and before and after and after == before and allow_store:
-        log("    · 重载后版本没变（浏览器里这份不是该解包目录），改走商店更新…")
+    # 线上版本查不到：只能跟磁盘比，但如实标注 verified=False
+    res["action"] = "disk-only"
+    if disk and before and _ver_cmp(disk, before) == 1:
+        log("    · 磁盘扩展 v%s 比已装 v%s 新 → 重载…" % (disk, before))
+        if reload_ext(port, ext_id, log=log):
+            after = _wait_ext_version(port, ext_id, log=log)
+            res["source"] = "disk"
+            res["changed"] = bool(after and before and _ver_cmp(after, before) == 1)
+    elif allow_store and not disk:
+        res["source"] = "store"
         if auto_update_ext(port, log=log):
-            time.sleep(3.0)
-            again = str(ext_info(port, ext_id, log=log).get("version") or "")
-            if again:
-                after = again
+            after = _wait_ext_version(port, ext_id, tries=6, gap=2.0, log=log)
+            res["changed"] = bool(after and before and _ver_cmp(after, before) == 1)
+    res["note"] = res["note"] or "线上最新版查询失败，本次只做了磁盘比对"
     res["after"] = after or before
     res["ok"] = bool(after or before)
-    res["changed"] = bool(after and before and after != before)
     return res
 
 
@@ -1640,6 +2368,8 @@ def main():
     ap.add_argument("--fresh-profile", action="store_true", help="自检用全新 profile 目录")
     ap.add_argument("--skip-update-test", action="store_true", help="自检跳过「验证更新」")
     ap.add_argument("--keep", action="store_true", help="自检结束后不关浏览器")
+    ap.add_argument("--prepare-ext", action="store_true",
+                    help="只把本地解包扩展目录刷到 GitHub 最新（不启动浏览器）")
 
     args = ap.parse_args()
     # 位置参数与 --port 共用同一个含义；argparse 里不能同名（位置参数的默认值
@@ -1651,6 +2381,17 @@ def main():
 
     if args.self_test:
         return self_test(args)
+
+    if args.prepare_ext:
+        # 只刷本地目录：不连 CDP、不 reload、不需要浏览器在跑。
+        d = ext_dir or (os.getenv("SC_EXT_DIR", "") or "").strip() or os.path.join(HERE, "scriptcat")
+        print("=== 本地解包扩展目录：%s ===" % d)
+        r = prepare_ext_dir(d, log=lambda m: print(m))
+        print("  → %s  v%s → v%s（线上最新 v%s）%s"
+              % ("OK" if r["ok"] else "未完成", r["before"] or "?",
+                 r["after"] or "?", r["latest"] or "?",
+                 ("；" + r["note"]) if r["note"] else ""))
+        return 0 if r["ok"] else 1
 
     ports = [(args.port, "指定端口")] if args.port else ACCOUNTS
 

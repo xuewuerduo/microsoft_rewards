@@ -73,16 +73,32 @@
  可选 SC_EXT_DIR               脚本猫解包扩展目录（默认从 /app/extensions、/data/extensions 找）
  可选 SC_AUTO_UPDATE           任务开跑前校准「已装脚本 vs 商店最新」，落后就更新
                                 （默认 1；0=只在 --update-script 时手动更新）
- 可选 SC_EXT_UPDATE            同上，顺带校准脚本猫扩展插件本身的版本
+ 可选 SC_EXT_UPDATE            任务开始前校准脚本猫扩展插件版本
                                 （默认 1；0=不检查扩展，只校准脚本）
- 可选 SC_CALIB_WAIT_SEC        等「脚本猫首轮心跳」再校准的最长秒数（默认 180）
-                                校准时机：启动阶段只确保可用，等脚本加载好、任务还没
-                                开跑时统一做一次，避免刚启动就 reload 打断初始化
+ 可选 SC_EXT_REPO              扩展版本来源仓库（默认 scriptscat/scriptcat）
+ 可选 SC_EXT_AUTOINSTALL       扩展落后时自动下载官方包覆盖解包目录（默认 1；0=只报告）
+ 可选 SC_EXT_MIRROR            GitHub 下载加速站，逗号分隔，按顺序试
+                                （默认 https://ghfast.top/,https://ghproxy.net/,
+                                 https://gh-proxy.com/ ；置空或 off=只直连）
+ 可选 SC_EXT_LATEST_TTL        「线上最新版」查询缓存秒数（默认 1800）
+ 可选 SC_EXT_PREP_MIN_GAP      启动预检与开跑前复核的最小间隔秒数（默认 300；
+                                间隔内直接复用启动时的结果，不重查 GitHub、不重下包）
+ 可选 SC_CALIB_WAIT_SEC        已废弃（保留只为兼容旧配置）：v0.81 起不再等「首轮心跳」，
+                                四个账号部署完就校准；比对是只读的，reload 由计划里的
+                                hold（暂缓开跑）保护
+
+  扩展更新走两段式（v0.82 起）：
+    ① 进程一启动：直接去 GitHub（走加速站）取最新脚本猫扩展，解包到本地固定目录
+       （SC_EXT_DIR 或 /app/extensions/scriptcat），不读浏览器、不跟浏览器比对；
+    ② 浏览器起来、任务开始前：逐账号比「浏览器已装版本 vs 本地目录版本」，
+       一致 → 继续检查用户脚本更新 → 放行任务；不一致 → reload 扩展（不重启浏览器）。
 
    命令行维护参数（面板正常运行时不带参数，行为完全不变）
      python3 zy.py --update-script    手动把签到脚本更新到商店最新版
                                       （浏览器没在跑会临时拉起，完成后自动关闭）
-     python3 zy.py --update-ext       手动把脚本猫扩展插件更新到最新（磁盘新版/商店）
+     python3 zy.py --update-ext       手动把脚本猫扩展对齐到线上最新版
+                                      （先刷本地目录：GitHub 加速站下载解包；
+                                        再逐账号 reload 对齐，不重启浏览器）
      python3 zy.py --install-script   重新安装/修复扩展 + 脚本 + Cookie 授权
      python3 zy.py --script-status    查看各账号已装脚本版本
 
@@ -211,12 +227,14 @@ RUN_DEADLINE = os.getenv("RUN_DEADLINE", "18:00").strip()
 #   ① 摇号上限收紧到「收工 - 最短时长」，正常不会摇到窗口末尾；
 #   ② 不在窗口内但距收工还够，照样启动（能跑多少算多少）；
 #   ③ 距收工不够这个数就不启动（跑了也完不成）；
-#   ④ 真的开机太晚，跑到收工就关，绝不顺延 —— 宁可少跑，也不越过收工时间。
+#   ④ 真的开机太晚，跑到收工就关；允许顺延时也绝不越过当天 0 点（见 RUN_LATE_EXTEND）。
 # 设 0 = 不设门槛（多晚都开机，到点就关）。
 RUN_MIN_SECONDS = int(os.getenv("RUN_MIN_SECONDS", "10800"))
 # 启动偏晚（现在距收工不足一轮 RUN_MIN_SECONDS）时怎么办：
 #   1（默认）不再直接放弃启动，也不再死守收工时刻；把收工从「现在」顺延一整轮
 #     （now + RUN_MIN_SECONDS），让脚本猫有足够时间把今天该跑的跑完，跑完再结束。
+#     ⚠ 顺延硬上限 = 当天 23:59：任务绝不允许排到 0 点之后（用户要求 2026-11-22）。
+#     截断后连 10 分钟都不到就不再启动 —— 跑也跑不出结果。
 #   0 旧行为：来不及跑完就不启动浏览器（下午才起来时会整天一个任务都不跑）。
 RUN_LATE_EXTEND = os.getenv("RUN_LATE_EXTEND", "1").strip().lower() not in ("0", "false", "no", "off")
 # 到收工时间时，若「脚本猫」还没报「全部完成」，再宽限多少秒收尾。
@@ -323,7 +341,8 @@ SC_EXT_DIR = os.getenv("SC_EXT_DIR", "")                # 脚本猫解包扩展�
 SC_AUTO_UPDATE = os.getenv("SC_AUTO_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
 # 同上，顺带校准脚本猫扩展插件本身（磁盘解包目录有新版本就 reload；商店版点一次更新）
 SC_EXT_UPDATE = os.getenv("SC_EXT_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
-# 等「脚本猫首轮心跳」的上限秒数：等到就校准，等不到也按这个时间兜底校准一次
+# 已废弃：v0.81 起不再等「脚本猫首轮心跳」（实测白等 30~100 秒）。
+# 变量保留只为不打断既有 .env；读进来的值不再参与任何判断。
 SC_CALIB_WAIT_SEC = int(os.getenv("SC_CALIB_WAIT_SEC", "180") or 180)
 # 校准前等「正在跑的那一轮跑完」的上限秒数：校准会重建后台上下文，
 # 中途插进去会把那一轮掐断（线上 20:45 long 那轮就是这么丢的）
@@ -782,6 +801,19 @@ _SCRIPT_FOOTPRINT = {}     # name -> True（采集到该账号任意用户脚本
 _LAST_LOG_TS = {}          # name -> 最近一条用户脚本日志的时刻（用于「跑到一半停摆」判断）
 _FIRST_LOG_TS = {}         # name -> 首条用户脚本日志的时刻（脚本已加载好的信号，用于校准时机）
 _CALIBRATED = threading.Event()   # 本次运行是否已做过「开跑前版本校准」
+# 扩展包「本地固定目录」的预检结果（全进程一份，与账号无关）。
+# 两段式（2026-11-22 定的口径）：
+#   ① 进程一启动就去 GitHub（走加速站）把最新脚本猫扩展下载 + 解包到本地固定目录，
+#      这一步不读浏览器、也不跟浏览器比对；
+#   ② 浏览器起来后，每个账号只比「浏览器里已装版本 vs 本地目录版本」，
+#      一致 → 继续校准用户脚本 → 放行任务。
+# 以前是「部署完一个账号就去 GitHub 比一次」，4 个账号各查一遍、5MB 包挤在开跑前后下，
+# 日志里「提示升级」要 100 秒后才出现。
+_EXT_BUNDLE = {}
+_EXT_BUNDLE_AT = 0.0
+_EXT_BUNDLE_LOCK = threading.Lock()
+# 启动预检的间隔：同一进程内重复调用（启动一次 + 开跑前复核一次）不重查、不重下
+SC_EXT_PREP_MIN_GAP = int(os.getenv("SC_EXT_PREP_MIN_GAP", "300") or 300)
 _NORUN_ALERTED = set()     # 已告警过的账号，避免每轮检查都重复弹
 _STALL_ALERTED = {}        # name -> 上次「停摆」告警时刻（隔一段时间才重复告警/重试修复）
 _STALL_TRIES = {}          # name -> 已经尝试过几次自动修复（第 2 次起改成 reload 扩展）
@@ -1326,6 +1358,28 @@ def _scriptcat_ext_dir(user_dir: str = None):
     return None
 
 
+def _local_ext_dir(user_dir: str = None):
+    """本地固定解包目录（扩展版本的唯一真相源）。
+
+    和 _scriptcat_ext_dir 的区别：那个只在「已经有 manifest.json」时返回路径，
+    用于「加载哪个目录」；这个用于「下载解压到哪里」—— 目录不存在也要给出一个
+    可创建的目标，否则第一次装的时候无从下手。顺序：
+      SC_EXT_DIR > 已探测到的 scriptcat 目录 > <可写扩展基目录>/scriptcat > zy.py 同目录 scriptcat
+    """
+    if SC_EXT_DIR:
+        return SC_EXT_DIR
+    found = _scriptcat_ext_dir(user_dir)
+    if found:
+        return found
+    for base in [os.path.join(HERE, "extensions")] + list(EXTENSION_DIRS):
+        try:
+            if os.path.isdir(base) and os.access(base, os.W_OK):
+                return os.path.join(base, "scriptcat")
+        except Exception:
+            continue
+    return os.path.join(HERE, "scriptcat")
+
+
 def _load_sc_deploy():
     """加载同目录的 sc_deploy.py（缺失/导入失败时返回 None，不影响主任务）。"""
     try:
@@ -1462,132 +1516,289 @@ def _ensure_script_latest(name: str, port: int, user_dir: str = None,
         return False
 
 
-# ── 开跑前一次性校准（脚本 + 扩展插件）────────────────────────────────────
-def _ensure_ext_latest(name: str, port: int, user_dir: str = None,
-                       ext_id: str = None) -> dict:
-    """校准脚本猫扩展插件本身：磁盘上有更新版本就 reload，商店版就点一次更新。
+# ── 开跑前一次性校准（先扩展、再脚本；扩展的「下载解包」在启动时就做完了）──
+def _bundle_latest() -> str:
+    """启动预检查到的线上最新版本（没查/没查到返回空串）。"""
+    with _EXT_BUNDLE_LOCK:
+        return str((_EXT_BUNDLE or {}).get("latest") or "")
 
-    只 reload 扩展，**绝不重启浏览器**：同一路径的扩展 ID 不变，脚本与
-    Cookie 授权都保留，代价只是后台 SW 重建一次。
-    返回 {ok, changed, before, after}；changed=True 时调用方应等几秒再读脚本。
+
+def _prepare_ext_bundle(reason: str = "启动", force: bool = True) -> dict:
+    """① 启动预检：把脚本猫扩展**下载并解包到本地固定目录**（全程不碰浏览器）。
+
+    用户口径（2026-11-22）：脚本一启动就去 GitHub、走加速站把最新包解到本地固定目录，
+    不跟浏览器比对。好处是那 5MB 下载从「浏览器起来之后、开跑前后」挪到最前面 ——
+    等浏览器起来时目录里已经是最新版，后面只剩「比版本 + reload」，几秒就完。
+
+    返回 {ok, before, after, latest, changed, verified, note}。
+    同一进程内 SC_EXT_PREP_MIN_GAP 秒内重复调用（force=False）直接复用上次结果，
+    启动一次 + 开跑前复核一次不该下两遍、也不该打两遍 GitHub。
     """
-    out = {"ok": False, "changed": False, "before": "", "after": ""}
-    if not SC_EXT_UPDATE or not port:
-        return out
+    global _EXT_BUNDLE, _EXT_BUNDLE_AT
+    skip = {"ok": False, "before": "", "after": "", "latest": "", "changed": False,
+            "verified": False, "note": "扩展更新已关闭（SC_EXT_UPDATE=0）"}
+    if not SC_EXT_UPDATE:
+        logger.info("🧩 扩展包预检：已关闭（SC_EXT_UPDATE=0），不查线上、不下载；"
+                    "浏览器起来后只按本地目录对齐")
+        return skip
+    with _EXT_BUNDLE_LOCK:
+        if _EXT_BUNDLE and not force and (time.time() - _EXT_BUNDLE_AT) < SC_EXT_PREP_MIN_GAP:
+            return dict(_EXT_BUNDLE)
     sd = _load_sc_deploy()
     if not sd:
-        return out
-    ext_dir = _scriptcat_ext_dir(user_dir)
-    eid = ext_id or sd.resolve_ext_id(port, ext_dir=ext_dir, user_dir=user_dir,
-                                      guess=False) or None
-    if not eid:
-        logger.info(f"  🔎 账号 {name} 认不到脚本猫扩展 ID，跳过扩展版本校准")
-        return out
+        logger.warning("⚠️ 扩展包预检跳过：找不到同目录 sc_deploy.py"
+                       "（浏览器起来后只能按本地目录对齐，不会再去线上查）")
+        return dict(skip, note="sc_deploy.py 不可用")
+    fn = getattr(sd, "prepare_ext_dir", None)
+    if not callable(fn):
+        logger.warning("⚠️ 同目录 sc_deploy.py 版本过旧（缺少 prepare_ext_dir），"
+                       "跳过扩展包预检 —— 请把新版 sc_deploy.py 一起上传")
+        return dict(skip, note="sc_deploy.py 缺少 prepare_ext_dir")
+    ext_dir = _local_ext_dir()
+    logger.info(f"🧩 扩展包预检（{reason}）：{ext_dir}")
     try:
-        fn = getattr(sd, "ensure_ext_current", None)
-        if not callable(fn):
-            logger.warning(f"  ⚠️ 账号 {name} 跳过扩展校准：同目录 sc_deploy.py 版本过旧"
-                           f"（缺少 ensure_ext_current），请把新版 sc_deploy.py 一起上传")
-            return False
-        r = fn(port, eid, ext_dir=ext_dir, allow_store=True,
-               log=lambda m: logger.info("   " + str(m).strip()))
+        r = fn(ext_dir, force=force, log=lambda m: logger.info("   " + str(m).strip()))
     except Exception as e:
-        logger.warning(f"  ⚠️ 账号 {name} 扩展版本检查异常（不影响任务继续）: {e}")
-        return out
-    out.update(ok=bool(r.get("ok")), changed=bool(r.get("changed")),
-               before=r.get("before") or "", after=r.get("after") or "")
-    if r.get("changed"):
-        logger.info(f"  ⬆️  账号 {name} 脚本猫扩展已更新：v{r.get('before')} → v{r.get('after')}"
-                    f"（来源：{'磁盘解包目录' if r.get('source') == 'disk' else '商店'}）")
-        return out
-    ver = r.get("after") or r.get("before") or "?"
-    if r.get("ok"):
-        logger.info(f"  🔎 账号 {name} 脚本猫扩展已是最新 v{ver}")
-        return out
-    logger.info(f"  🔎 账号 {name} 扩展版本未确认（v{ver}），继续执行任务")
+        logger.warning(f"⚠️ 扩展包预检异常（不影响任务继续）: {e}")
+        return dict(skip, note=f"异常：{e}")
+
+    out = {"ok": bool(r.get("ok")), "before": str(r.get("before") or ""),
+           "after": str(r.get("after") or ""), "latest": str(r.get("latest") or ""),
+           "changed": bool(r.get("changed")), "verified": bool(r.get("verified")),
+           "note": str(r.get("note") or "")}
+    after, latest = out["after"], out["latest"]
+    if out["changed"]:
+        logger.info(f"  ✅ 已下载并解包到本地目录：v{out['before'] or '无'} → v{after}"
+                    f"（线上最新 v{latest or '?'}）")
+        logger.info("     · 浏览器起来后只比「已装版本 vs 这个本地目录」，一致就直接检查脚本")
+    elif out["ok"] and out["verified"]:
+        logger.info(f"  ✅ 本地脚本猫扩展已是最新 v{after or latest}（线上最新 v{latest}）")
+    elif out["ok"]:
+        logger.info(f"  ✅ 本地脚本猫扩展 v{after or '?'}（线上版本没取到，"
+                    f"本次只按本地目录比对：{out['note'] or '网络不可用'}）")
+    else:
+        logger.warning(f"  ⚠️ 本地脚本猫扩展没能升到最新：v{out['before'] or '?'} → "
+                       f"v{after or '?'}（线上最新 v{latest or '?'}；"
+                       f"{out['note'] or '原因见上'}）")
+        note = out["note"]
+        if "不可写" in note or "只读" in note:
+            logger.warning("     · 解包目录只读：chmod -R u+w /app/extensions，"
+                           "或把 SC_EXT_DIR 指到可写目录后重跑（不必重建容器）")
+        logger.warning("     · 浏览器起来后只按本地目录对齐，不会因此卡住任务")
+    with _EXT_BUNDLE_LOCK:
+        _EXT_BUNDLE, _EXT_BUNDLE_AT = dict(out), time.time()
     return out
 
 
-def _calibrate_one(name: str, port: int, user_dir: str):
-    """单个账号的开跑前校准：先扩展插件，再签到脚本（共用一次扩展 ID 探测）。"""
+def _ext_sync_local(name: str, port: int, user_dir: str, ext_id: str = None) -> dict:
+    """② 浏览器侧对齐：只比「浏览器已装版本 vs 本地固定目录版本」，**不查 GitHub**。
+
+    顺序就是用户要的那条：扩展版本和本地目录一致 → 继续检查脚本更新 → 开始任务。
+    不一致（已装落后本地 / 本地刚换过文件）就 reload 一次让 Chrome 读新文件 ——
+    同路径同 ID，脚本与 Cookie 授权都保留，不重启浏览器、不重开 profile。
+
+    返回 {ok, installed, local, changed, after, note}
+    """
+    out = {"ok": False, "installed": "", "local": "", "changed": False,
+           "after": "", "note": ""}
+    if not SC_EXT_UPDATE or not port:
+        out["note"] = "扩展检查已关闭（SC_EXT_UPDATE=0）或无 CDP"
+        return out
+    sd = _load_sc_deploy()
+    if not sd:
+        out["note"] = "sc_deploy.py 不可用"
+        return out
+    ext_dir = _local_ext_dir(user_dir)
+    local = ""
+    try:
+        local = str(sd.disk_ext_version(ext_dir) or "")
+    except Exception as e:
+        out["note"] = f"读本地目录版本失败：{e}"
+    out["local"] = local
+
+    eid = ext_id
+    if not eid:
+        try:
+            eid = sd.resolve_ext_id(port, ext_dir=ext_dir, user_dir=user_dir,
+                                    guess=False) or None
+        except Exception:
+            eid = None
+    if not eid:
+        out["note"] = "认不到扩展 ID"
+        logger.info(f"  🔎 账号 {name} 认不到脚本猫扩展 ID，跳过扩展比对（任务照旧继续）")
+        return out
+
+    try:
+        info = sd.ext_info(port, eid) or {}
+    except Exception as e:
+        out["note"] = f"读已装版本失败：{e}"
+        logger.warning(f"  ⚠️ 账号 {name} 读扩展版本失败（不影响任务继续）: {e}")
+        return out
+    installed = str(info.get("version") or "")
+    out["installed"] = out["after"] = installed
+    loc = str(info.get("location") or "")
+    lv = _bundle_latest()
+
+    if not local:
+        out["note"] = "本地扩展目录没有 manifest.json（预检没成功？）"
+        logger.warning(f"  ⚠️ 账号 {name} 扩展 v{installed or '?'}：{out['note']}，"
+                       f"本次没有标尺可比，直接继续检查脚本")
+        return out
+    if not installed:
+        out["note"] = "浏览器里读不到扩展版本"
+        logger.warning(f"  ⚠️ 账号 {name} 浏览器里读不到脚本猫扩展版本（本地 v{local}），"
+                       f"直接继续检查脚本")
+        return out
+
+    try:
+        cmp = sd._ver_cmp(installed, local)
+    except Exception:
+        cmp = None
+    if cmp == 0:
+        out["ok"] = True
+        logger.info(f"  ✅ 账号 {name} 扩展 v{installed} 与本地目录一致"
+                    + (f"（线上最新 v{lv}）" if lv else "") + "，继续检查脚本")
+        return out
+    if cmp == 1:
+        out["ok"] = True
+        logger.info(f"  🔎 账号 {name} 浏览器里 v{installed} 比本地目录 v{local} 新"
+                    f"（本地开发版），保留不降级")
+        return out
+
+    logger.info(f"  🔄 账号 {name} 扩展 v{installed} < 本地目录 v{local}"
+                f" → 重载扩展让浏览器读新文件…")
+    try:
+        sd.reload_ext(port, eid, log=lambda m: logger.info("     " + str(m).strip()))
+        after = str(sd._wait_ext_version(port, eid, want=local,
+                                         log=lambda m: logger.info("     " + str(m).strip()))
+                    or installed)
+    except Exception as e:
+        after = installed
+        out["note"] = f"reload 失败：{e}"
+    out["after"] = after
+    try:
+        ok_after = bool(after) and sd._ver_cmp(after, local) in (0, 1)
+        changed = ok_after and bool(sd._ver_cmp(after, installed) == 1)
+    except Exception:
+        ok_after = changed = False
+    if ok_after:
+        out["ok"] = True
+        out["changed"] = changed
+        logger.info(f"  ✅ 账号 {name} 扩展已对齐本地 v{local}"
+                    + (f"（{installed} → {after}）" if changed else ""))
+    else:
+        out["note"] = out["note"] or f"重载后仍是 v{after or '?'}"
+        extra = (f"（location={loc}，不是解包安装，目录覆盖不到它）"
+                 if loc and loc != "UNPACKED" else "")
+        logger.warning(f"  ⚠️ 账号 {name} 重载后扩展仍是 v{after or '?'}，"
+                       f"本地目录是 v{local}{extra}；继续执行任务，不影响本轮")
+    return out
+
+
+def _calibrate_one(name: str, port: int, user_dir: str, only_ext: bool = False):
+    """单个账号的开跑前校准：先「扩展版本 == 本地目录版本」，再签到脚本。
+
+    就是用户要的那条链：扩展和本地一致 → 检查脚本更新 → 放出任务。
+    扩展不一致只 reload（同路径同 ID，脚本与 Cookie 授权都保留），不重启浏览器。
+    only_ext=True 只做扩展那半段（给维护命令用）；正常任务一律做全套。
+    """
     sd = _load_sc_deploy()
     if not sd:
         return
     eid = None
     try:
-        eid = sd.resolve_ext_id(port, ext_dir=_scriptcat_ext_dir(user_dir),
+        eid = sd.resolve_ext_id(port, ext_dir=_local_ext_dir(user_dir),
                                 user_dir=user_dir, guess=False) or None
     except Exception:
         eid = None
     ext = {"changed": False}
     if SC_EXT_UPDATE:
-        ext = _ensure_ext_latest(name, port, user_dir, ext_id=eid)
-    if SC_AUTO_UPDATE:
-        if ext.get("changed"):
-            # 扩展刚 reload 过，后台 SW 还在重建，脚本列表可能一时读不到 → 等一会儿再读
-            logger.info(f"   · 账号 {name} 扩展刚重载，等 4 秒让脚本猫重新注册脚本…")
-            time.sleep(4)
-        for attempt in range(3):
+        # 只比「浏览器已装 vs 本地固定目录」：线上版本在进程启动时（_prepare_ext_bundle）
+        # 就已经落到本地目录了，这里绝不再去 GitHub 查 —— 4 个账号各查一遍纯属浪费。
+        ext = _ext_sync_local(name, port, user_dir, ext_id=eid)
+    # 旧版 sc_deploy 或异常路径可能返回 bool，不能直接当 dict 用
+    if not isinstance(ext, dict):
+        ext = {"changed": False}
+    if only_ext:
+        return
+    if not SC_AUTO_UPDATE:
+        return
+    if ext.get("changed"):
+        # 扩展换了新版本，Chrome 侧的「允许用户脚本」开关与扩展内配置可能被重置；
+        # 脚本猫 SW 也在重建，脚本列表一时读不到 → 先补开关，再等几秒读脚本。
+        logger.info(f"   · 账号 {name} 扩展刚换版"
+                    f"（v{ext.get('installed')} → v{ext.get('after')}），"
+                    f"重新确认「允许用户脚本」与静默更新…")
+        for fn, args, kw in (
+            ("allow_userscripts", (port,), {}),
+            ("set_silent_update", (port,), {"ext_id": eid}),
+        ):
+            f = getattr(sd, fn, None)
+            if not callable(f):
+                continue
             try:
-                # 扩展 ID 已认好，传进去省一次 chrome://extensions 探测
-                if _ensure_script_latest(name, port, user_dir, ext_id=eid):
-                    return
+                f(*args, log=lambda m: logger.info("     " + str(m).strip()), **kw)
             except Exception as e:
-                logger.warning(f"  ⚠️ 账号 {name} 脚本版本校准异常: {e}")
+                logger.warning(f"   · 账号 {name} {fn} 失败（不影响任务继续）: {e}")
+        logger.info(f"   · 账号 {name} 等 4 秒让脚本猫重新注册脚本…")
+        time.sleep(4)
+    for attempt in range(3):
+        try:
+            # 扩展 ID 已认好，传进去省一次 chrome://extensions 探测
+            if _ensure_script_latest(name, port, user_dir, ext_id=eid):
                 return
-            if attempt < 2:
-                logger.info(f"   · 账号 {name} 脚本版本暂未读到，5 秒后重试（{attempt + 1}/2）")
-                time.sleep(5)
+        except Exception as e:
+            logger.warning(f"  ⚠️ 账号 {name} 脚本版本校准异常: {e}")
+            return
+        if attempt < 2:
+            logger.info(f"   · 账号 {name} 脚本版本暂未读到，5 秒后重试（{attempt + 1}/2）")
+            time.sleep(5)
 
 
 def _pre_task_calibrate(browsers, plan=None, max_wait=None):
-    """任务正式开跑前的一次性版本校准（脚本 + 扩展插件）。
+    """任务正式开跑前的一次性校准：扩展对齐本地 → 检查脚本更新 → 放行任务。
 
-    时机设计（用户要求）：
-      · 启动阶段只把扩展/脚本「装好、启用、授权」，不做版本比对、不 reload；
-      · 等脚本猫首轮心跳出现（说明扩展加载完、脚本读完计划，任务还没开跑），
-        这时统一校准一次 —— 既不会漏掉落后版本，也不会在启动初始化期间
-        把后台上下文打断；
-      · 心跳等不到（脚本没跑起来）就按 max_wait 兜底校准，只做一次。
-    全程只对已经在跑的浏览器操作，不重启浏览器，也不重复打开。
+    流程（2026-11-22 用户口径）：
+      ① 扩展包的「查询 + 下载 + 解包」早在进程启动时就做完了（_prepare_ext_bundle），
+         本地固定目录里已经是最新版；
+      ② 四个账号浏览器起来后，这里逐个比「已装版本 vs 本地目录版本」，不一致就
+         reload（同路径同 ID，脚本与 Cookie 授权都保留，不重启浏览器、不重开 profile）；
+      ③ 扩展一致后继续校准用户脚本版本；全部做完才解除计划 hold，任务才真正开始。
+    所以这里既不查 GitHub、也不下 5MB 包 —— 4 个账号只剩「读版本 + 可能 reload」。
+    计划里的 hold 保证脚本在校准期间不会抢先开跑，因此不再等「脚本猫首轮心跳」；
+    仍留一小段 _wait_rounds_idle，兜住「沿用上一轮浏览器、里面正有一轮在跑」的情况。
+    max_wait 保留仅为兼容旧调用。
     """
     targets = [(n, p, u) for n, u, _pid, p, _r in browsers
                if p and not _ACCOUNT_DONE.get(n)]
     if not targets:
+        # 没有可校准对象也必须放行，否则 hold 只能靠有效期兜底，白耽误一个执行点
+        try:
+            set_plan_hold(False)
+        except Exception:
+            pass
         return
     if _CALIBRATED.is_set():
         return
-    limit = SC_CALIB_WAIT_SEC if max_wait is None else int(max_wait)
-    deadline_ts = time.time() + max(0, limit)
-    why = ""
-    while True:
-        now = time.time()
-        with _NORUN_LOCK:
-            ready = [n for n, _, _ in targets if n in _FIRST_LOG_TS]
-        if len(ready) >= len(targets):
-            why = "脚本猫首轮心跳已到"
-            break
-        if now >= deadline_ts:
-            why = f"等了 {limit} 秒仍未见首轮心跳"
-            break
-        if _TERMINATED or _ALL_DONE.is_set():
-            return
-        dl = (plan or {}).get("deadline")
-        if dl is not None:
-            try:
-                if datetime.now() >= dl:
-                    return          # 已到收工时间，没必要再折腾版本
-            except Exception:
-                pass
-        # 用 Event.wait 而不是 sleep：全部账号提前完成时能立刻退出
-        if _ALL_DONE.wait(5) or _TERMINATED:
-            return
-
-    logger.info(f"🧩 开跑前版本校准（{why}）：只对已运行的浏览器操作，扩展只 reload、不重启浏览器")
+    with _EXT_BUNDLE_LOCK:
+        bundle = dict(_EXT_BUNDLE or {})
+    local_ver = bundle.get("after") or bundle.get("before") or ""
+    lv = bundle.get("latest") or ""
+    if local_ver:
+        logger.info(f"🧩 开跑前校准：本地扩展包 v{local_ver}"
+                    + (f"（线上最新 v{lv}）" if lv else "")
+                    + " → 逐账号比对浏览器扩展 → 检查脚本更新")
+    else:
+        logger.info("🧩 开跑前校准：扩展包预检没有结果（见上方日志）→ "
+                    "仍按本地目录比对 → 检查脚本更新")
     try:
-        if not _wait_rounds_idle(SC_CALIB_ROUND_WAIT):
-            logger.info("⏭️ 仍有一轮没跑完，本次跳过版本校准（下次任务开始前再校准，避免掐断正在跑的轮次）")
-            return
+        # reload 扩展 / reload 用户脚本都会重建脚本猫后台上下文，正有一轮在跑就等它跑完。
+        # 校准在 hold 期间做，通常这里立即返回；最多等 60 秒，等不到照做（任务幂等）。
+        wait_sec = min(SC_CALIB_ROUND_WAIT, 60)
+        if not _wait_rounds_idle(wait_sec):
+            logger.warning(f"⚠️ 有账号正在执行本轮任务（等了 {int(wait_sec)} 秒）："
+                           f"照旧校准，最多掐断当前这一轮（任务幂等，下一轮会重做）")
+
         ths = []
         for n, p, u in targets:
             t = threading.Thread(target=_calibrate_one, args=(n, p, u),
@@ -1595,8 +1806,8 @@ def _pre_task_calibrate(browsers, plan=None, max_wait=None):
             t.start()
             ths.append(t)
         for t in ths:
-            t.join(timeout=240)
-        logger.info("🧩 开跑前版本校准结束（本次运行不再重复检查）")
+            t.join(timeout=300)
+        logger.info("🧩 开跑前校准结束，放行任务（本次运行不再重复检查）")
     finally:
         _CALIBRATED.set()
         # 无论校准成功、失败还是被跳过，都必须放行脚本 —— 否则 hold 只能靠有效期兜底，
@@ -3327,18 +3538,32 @@ def wait_for_run_window(run_seconds: int = 0):
                 if RUN_LATE_EXTEND:
                     # 顺延一整轮，再多留 2 分钟收尾余量：既避开 _finish() 里
                     # 「距收工不足最短时长」的误报，也给脚本猫末轮搜索留出收尾时间。
+                    # ⚠ 但绝不跨过 0 点（用户要求 2026-11-22）：任务只能排到今天之内。
+                    # 以前 20:58 启动会顺延到次日 00:00，脚本那边虽然按 23:59 截止，
+                    # 浏览器却白开到 0 点后，计划里的 runUntil 也是跨天日期。
                     old_deadline = deadline
                     deadline = now + timedelta(seconds=min_secs + 120)
+                    day_end = now.replace(hour=23, minute=59, second=0, microsecond=0)
+                    capped = deadline > day_end
+                    if capped:
+                        deadline = day_end
+                    # 截断后连 10 分钟都不到：跑也跑不出结果，不如不启动
+                    if (deadline - now).total_seconds() < 600:
+                        logger.warning(f"⏰ 当前 {now:%H:%M} 距 0 点不足 10 分钟"
+                                       f"（收工上限 {day_end:%H:%M}）→ 今天来不及跑，"
+                                       f"本次不启动浏览器")
+                        return None
+                    tail = f"，但今天最多到 {deadline:%H:%M}、不跨 0 点" if capped else ""
                     if deadline_rolled:
                         logger.warning(f"⏰ 当前 {now:%H:%M} 启动偏晚，今天收工点 {old_deadline:%H:%M} 已过，"
                                        f"不足一轮最短运行时长 {_fmt_dur(min_secs)}。"
-                                       f"按「跑完再结束」处理：不再死守原收工时间，"
-                                       f"收工顺延到 {deadline:%H:%M}（现在起算一整轮），立即启动浏览器")
+                                       f"按「跑完再结束」处理：收工顺延到 {deadline:%H:%M}"
+                                       f"（现在起算一整轮{tail}），立即启动浏览器")
                     else:
                         logger.warning(f"⏰ 当前 {now:%H:%M} 启动偏晚，距原收工只剩 {_fmt_dur(left)}，"
                                        f"不足一轮最短运行时长 {_fmt_dur(min_secs)}。"
-                                       f"按「跑完再结束」处理：不再死守原收工时间，"
-                                       f"收工顺延到 {deadline:%H:%M}（现在起算一整轮），立即启动浏览器")
+                                       f"按「跑完再结束」处理：收工顺延到 {deadline:%H:%M}"
+                                       f"（现在起算一整轮{tail}），立即启动浏览器")
                 else:
                     logger.warning(f"⏰ 当前 {now:%H:%M} 不在运行时段 {label} 内，且距收工 "
                                    f"{deadline:%H:%M} 只剩 {_fmt_dur(left)}"
@@ -3487,17 +3712,41 @@ def _verify_plan_http(port: int = 0):
 
     以前的形态：文件写成功、日志一切正常，但无头模式下没有任何进程提供它，
     脚本猫整天读不到 → 回退成全天唤醒分布 → 执行点撒在已经过去的时刻上。
-    这种失败必须当场喊出来，不能等用户去看日志猜。"""
+    这种失败必须当场喊出来，不能等用户去看日志猜。
+
+    2026-11-22 又补一条：只验「能读到 JSON」不够。端口上可能是**上一轮残留的实例**
+    在应答（bind 失败换端口时，脚本仍优先访问 47831），读到的计划内容不是这次写的 ——
+    自检却照样打勾，脚本那边按旧开机时刻排程。所以要比对内容里的 startAt。"""
     port = port or _PLAN_HTTP_PORT or _novnc_port()
     url = f"http://127.0.0.1:{port}/zy-run-plan.json"
-    if _probe_plan(port):
-        logger.info(f"✅ 计划自检通过：脚本猫可从 {url} 读取")
-        return True
-    logger.warning(f"⚠️ 计划自检失败：{url} 读不到")
-    tried = "、".join(f"{p}" for p in PLAN_HTTP_PORTS)
-    logger.warning(f"   → 已尝试端口 {tried}，脚本猫会退回「全天唤醒分布」，"
-                   f"执行点可能撒在已过去的时刻")
-    return False
+    got = ""
+    try:
+        with urllib.request.urlopen(url, timeout=2) as r:
+            got = r.read(2000).decode("utf-8", "replace")
+    except Exception:
+        got = ""
+    if not got:
+        logger.warning(f"⚠️ 计划自检失败：{url} 读不到")
+        tried = "、".join(f"{p}" for p in PLAN_HTTP_PORTS)
+        logger.warning(f"   → 已尝试端口 {tried}，脚本猫会退回「全天唤醒分布」，"
+                       f"执行点可能撒在已过去的时刻")
+        return False
+    want = ""
+    try:
+        want = str((json.loads(_PLAN_HTTP_TEXT or "{}") or {}).get("startAt") or "")
+    except Exception:
+        want = ""
+    try:
+        actual = str((json.loads(got) or {}).get("startAt") or "")
+    except Exception:
+        actual = ""
+    if want and actual and actual != want:
+        logger.warning(f"⚠️ 计划自检内容不符：{url} 返回的开机时刻是 {actual}，"
+                       f"本次写入的是 {want} —— 端口上可能是上一轮残留的实例在应答，"
+                       f"脚本猫会按旧计划排程")
+        return False
+    logger.info(f"✅ 计划自检通过：脚本猫可从 {url} 读取")
+    return True
 
 
 # 最近一次写出的计划体：set_plan_hold() 要在原样基础上只改 hold 字段
@@ -3602,27 +3851,38 @@ def main():
     logger.info(f"  HEADLESS_MODE = {HEADLESS_MODE}  DESKTOP_ENABLE = {DESKTOP_ENABLE}")
     logger.info(f"  搜索参数请查看「脚本猫-微软积分商城签到脚本」的 UserConfig 页面配置")
 
-    # 容器重启后 XDG_RUNTIME_DIR 常常不存在：labwc/wayvnc 起不来、chromium 报
-    # 「XDG_RUNTIME_DIR is invalid or not set」，最终 noVNC 页面空白。先补上。
-    if DESKTOP_ENABLE:
-        _ensure_xdg_runtime()
-
     # 单实例保护：若已有同脚本的任务实例在运行，直接退出，避免两个任务
     # 并发启动同一批 profile → Chromium 报「Profile error occurred」/互相抢占。
     if _is_task_running_elsewhere():
         logger.warning("⚠️ 检测到已有「微软积分任务」在运行，本实例直接退出（避免多任务抢占浏览器 profile）")
         sys.exit(0)
 
+    # 🧩 启动第 1 步：扩展包预检 —— 进程一起来就做，顺序上在
+    #    「账号列表 / 桌面 / GUI 窗口命令 / 任何浏览器」之前。
+    #    直接去 GitHub（走加速站）取最新脚本猫扩展，解包到本地固定目录，
+    #    并把版本结果落到本地缓存文件；浏览器起来后只读本地目录比对。
+    #    放在最前面就是因为 5MB 下载才是慢的那一段：以前挤在开跑前后，
+    #    实测 100 秒后才看到「需要升级」。
+    _prepare_ext_bundle("进程启动", force=True)
+
+    # 容器重启后 XDG_RUNTIME_DIR 常常不存在：labwc/wayvnc 起不来、chromium 报
+    # 「XDG_RUNTIME_DIR is invalid or not set」，最终 noVNC 页面空白。先补上。
+    if DESKTOP_ENABLE:
+        _ensure_xdg_runtime()
+
+    # 清理 GUI 窗口命令残留，必须赶在「桌面起来 / desktop.sh autostart」之前：
+    # 上一轮留下的 .sh 带着已经失效的 WAYLAND_DISPLAY/XDG_RUNTIME_DIR，被
+    # autostart 执行会直接拉起浏览器（看起来就是「还没检查扩展就打开浏览器」），
+    # 或者多出几条平铺规则把窗口排到屏幕外。
+    cleanup_gui_cmd_dir([])
+
     accounts = load_accounts()
     logger.info(f"👥 共 {len(accounts)} 个账号")
     for acc in accounts:
         logger.info(f"  - {acc['name']} ({acc['email']})  → 用户目录: {CHROME_USER_DATA_BASE}/user-{acc['name']}")
 
-    # 清理 GUI 窗口命令目录里所有 .sh。上一轮留下的文件可能带着已经失效的
-    # WAYLAND_DISPLAY/XDG_RUNTIME_DIR，被 desktop.sh 的 autostart 执行会直接
-    # 报「Failed to connect to Wayland display」退出；也可能带来多余的平铺规则。
-    # 本轮会按当前真实 socket 重新写（gui 模式下面一次性写全部账号）。
-    cleanup_gui_cmd_dir([])
+    # 🧩 扩展包预检已在 main() 最开头做掉（见「启动第 1 步」）：账号列表、桌面、
+    #    GUI 窗口命令、浏览器都在它之后。这里不再重复。
 
     # GUI 模式：桌面一起来就该让所有账号窗口同时显示，先把所有账号的窗口命令
     # 写好，避免「只写了第一个账号、其余还是上一轮的坏文件」。
@@ -3655,6 +3915,20 @@ def main():
         delay = random.randint(0, RANDOM_DELAY)
         logger.info(f"【随机延迟】等待 {delay} 秒后开始执行...")
         time.sleep(delay)
+
+    # 🧩 开跑前复核本地扩展包：启动预检到此可能已过了几个小时（RUN_WINDOW 随机等）。
+    #    SC_EXT_PREP_MIN_GAP 内直接复用启动结果、不重查不重下；超过就重查一次
+    #    （ext_latest 自己有 30 分钟缓存，通常只是读一次本地 manifest）。
+    #    这里仍然不碰浏览器 —— 浏览器启动时直接读这份目录。
+    _prep = _prepare_ext_bundle("开跑前复核", force=False)
+    if SC_EXT_UPDATE and not (_prep.get("after") or _prep.get("before")):
+        # 启动那次没拿到任何版本（sc_deploy 旧版 / 异常 / 目录没写权限）→ 这里补一次。
+        # 宁可晚几秒，也不要在「本地目录还没对齐」的情况下先把浏览器拉起来。
+        logger.warning("⚠️ 启动预检没拿到本地扩展版本，开浏览器前同步补做一次…")
+        _prep = _prepare_ext_bundle("开跑前兜底", force=True)
+    if SC_EXT_UPDATE:
+        logger.info(f"🧩 开浏览器前的本地扩展版本：v{_prep.get('after') or _prep.get('before') or '?'}"
+                    f"（线上最新 v{_prep.get('latest') or '未取到'}）")
 
     # —— 四账号同时上线 ——
     # 先并发把所有账号的浏览器拉起来（几秒内全部就绪），再逐个做登录检查。
@@ -3773,6 +4047,11 @@ def main():
                 _ensure_script_deploy(name, user_dir, port)
             except Exception as e:
                 logger.warning(f"⚠️ 账号 {name} 脚本猫部署失败（不影响任务继续）: {e}")
+
+        # 🧩 扩展版本**不在这里**比：线上最新版在进程启动时就已经下载解包到本地目录了
+        #    （_prepare_ext_bundle），这里每个账号只做「装好/启用/授权」。
+        #    「浏览器已装版本 vs 本地目录版本」统一放到开跑前校准里做（_pre_task_calibrate），
+        #    顺序就是：扩展对齐 → 检查脚本更新 → 放行任务。放在这里比只会让日志多打一遍。
 
         # 登录判断：rewards.bing.com + email 比对
         result = {"ok": None, "matched": False, "reason": "CDP 未开启，跳过登录检查", "current_email": None}
@@ -3963,13 +4242,10 @@ def main():
         threading.Thread(target=_no_run_watch, name="no-run-watch", daemon=True).start()
 
     # 🧩 开跑前一次性版本校准（脚本 + 扩展插件）：
-    #    写计划时已经置了「暂缓开跑」，所以脚本不会抢先开跑；这里等首轮心跳 +
-    #    轮次空窗，再统一校准一次，结束后放行。
+    #    写计划时已经置了「暂缓开跑」，脚本不会抢先开跑；四个账号部署完就立刻校准，
+    #    不再等「脚本猫首轮心跳」（那一步只会让提示和升级都晚 30~100 秒）。
     if (SC_AUTO_UPDATE or SC_EXT_UPDATE) and browsers:
-        max_wait = SC_CALIB_WAIT_SEC if SC_LOG_CAPTURE else min(30, max(5, SC_CALIB_WAIT_SEC))
-        if not SC_LOG_CAPTURE:
-            logger.info(f"ℹ️  未开启脚本猫日志采集（等不到首轮心跳）→ {max_wait} 秒后直接校准版本")
-        threading.Thread(target=_pre_task_calibrate, args=(browsers, plan, max_wait),
+        threading.Thread(target=_pre_task_calibrate, args=(browsers, plan, 0),
                          name="pre-task-calibrate", daemon=True).start()
     else:
         # 没有可校准的对象（或校准被环境变量关掉）：立刻放行，别让脚本白等
@@ -4073,6 +4349,9 @@ def _cli_update_scripts(install: bool = False) -> int:
         return 1
     accounts = load_accounts()
     action = "安装/修复" if install else "更新"
+    # 先刷本地扩展包，再起浏览器：手动装/修脚本时浏览器用的是解包目录，
+    # 目录还是旧版的话装完脚本还是旧扩展（和正常任务是同一套两段式口径）。
+    _prepare_ext_bundle(f"手动{action}前", force=True)
     logger.info(f"🔧 手动{action}「{SC_SCRIPT_NAME}」脚本（商店 #{SC_SCRIPT_ID}），共 {len(accounts)} 个账号")
     rc = 0
     for i, acc in enumerate(accounts):
@@ -4128,9 +4407,11 @@ def _cli_update_scripts(install: bool = False) -> int:
 
 
 def _cli_update_ext() -> int:
-    """命令行手动更新脚本猫扩展插件（磁盘解包目录有新版本 / 商店有新版本时）。
+    """命令行手动更新脚本猫扩展插件：先刷本地目录，再逐账号对齐。
 
-    和 --update-script 一样：浏览器在跑就直接操作，没跑就临时拉起、完事关掉。
+    和正常任务走同一条两段式：① 去 GitHub（加速站）把最新包解到本地固定目录；
+    ② 浏览器里已装版本与本地不一致的，reload 一次。浏览器在跑就直接操作，
+    没跑就临时拉起、完事关掉。
     """
     sd = _load_sc_deploy()
     if not sd:
@@ -4139,6 +4420,11 @@ def _cli_update_ext() -> int:
     accounts = load_accounts()
     logger.info(f"🔧 手动更新「脚本猫」扩展插件，共 {len(accounts)} 个账号")
     rc = 0
+    # ① 本地目录：直接对齐 GitHub 最新（不涉及浏览器）
+    bun = _prepare_ext_bundle("手动 --update-ext", force=True)
+    if not bun.get("ok"):
+        logger.error(f"❌ 本地扩展目录没能升到最新：{bun.get('note') or '原因见上'}")
+        rc = 1
     for i, acc in enumerate(accounts):
         name = acc["name"]
         user_dir = os.path.join(CHROME_USER_DATA_BASE, f"user-{name}")
@@ -4160,23 +4446,15 @@ def _cli_update_ext() -> int:
             wait_browser_ready(user_dir, port, timeout=40)
             started = True
         try:
-            ext_dir = _scriptcat_ext_dir(user_dir)
-            disk = sd.disk_ext_version(ext_dir)
-            eid = sd.resolve_ext_id(port, ext_dir=ext_dir, user_dir=user_dir) or None
-            if not eid:
-                logger.error(f"❌ 账号 {name}：认不到脚本猫扩展")
-                rc = 1
-                continue
-            r = sd.ensure_ext_current(port, eid, ext_dir=ext_dir, allow_store=True,
-                                      log=lambda m: logger.info("   " + str(m).strip()))
-            if r.get("changed"):
-                logger.info(f"✅ 账号 {name}：扩展 v{r.get('before')} → v{r.get('after')}"
-                            f"（{'磁盘 v%s' % disk if r.get('source') == 'disk' else '商店'}）")
-            elif r.get("ok"):
-                logger.info(f"✅ 账号 {name}：扩展已是最新 v{r.get('after') or r.get('before')}"
-                            f"（磁盘 v{disk or '未提供'}）")
+            # ② 浏览器对齐本地目录（不查 GitHub）
+            r = _ext_sync_local(name, port, user_dir)
+            if r.get("ok"):
+                logger.info(f"✅ 账号 {name}：扩展 v{r.get('after') or r.get('installed')}"
+                            f"（本地目录 v{r.get('local')}）"
+                            + ("，已重载对齐" if r.get("changed") else "，本来就一致"))
             else:
-                logger.error(f"❌ 账号 {name}：扩展版本未确认（v{r.get('before')}）")
+                logger.error(f"❌ 账号 {name}：扩展 v{r.get('installed') or '?'} 没能对齐本地 "
+                             f"v{r.get('local') or '?'}（{r.get('note') or '原因见上'}）")
                 rc = 1
         except Exception as e:
             logger.error(f"❌ 账号 {name}：扩展更新异常 {e}")

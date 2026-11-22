@@ -11,3 +11,8 @@ yh.js
 cdp_update.py
 dump_sc_log.py
 fix_planurl.py
+
+# 扩展版本查询缓存 / 覆盖解包目录时的备份
+.sc-ext-latest.json
+*.bak-*
+*.new-*

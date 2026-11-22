@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      0.75
+// @version      0.84
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；已适配 zy 版逻辑（每日随机排程、中文热搜、llq.py 上报、多账号 CDP 端口）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -80,11 +80,22 @@ Config:
     spread:
         title: 搜索分散到全天(本轮次数按剩余轮数上下随机，可能整轮跳过；关掉=每轮满功率搜 20 分钟)
         type: checkbox
-        default: true
+        default: false
+    nodeGapMin:
+        title: 节点间隔最小值(秒)。一轮里的节点=一次 20 分钟窗口，只做一种任务（全搜索/全阅读/其他活动）；节点之间停这么久
+        type: number
+        default: 60
+        min: 0
+    nodeGapMax:
+        title: 节点间隔最大值(秒)。与最小值之间随机取（默认 1~3 分钟）
+        type: number
+        default: 180
+        min: 0
     winTime:
-        title: 运行时段(格式 开始-结束，如 09:00-23:00；前后时间相同则全天不限)
+        title: 运行时段(可留空，跟随 zy.py 计划；仅在没有计划时兜底；00:00-00:00=全天不限)
         type: text
-        default: 09:00-23:00
+        default: auto
+        description: 推荐留空或填 auto。zy.py 在跑时，时段一律取计划里的「开机~收工」，这里填什么都不影响任务。只有读不到计划时（脚本脱离 zy.py 单独跑）它才生效，此时留空按 09:00-23:00 兜底，也可填具体时段，填 00:00-00:00 表示全天不限
     wakeMode:
         title: 唤醒分布(random=每天随机选上午/下午/全天，区间内撒5-6个随机时刻；morning=固定上午9-13；afternoon=固定下午13-18；full=固定全天9-18)
         type: select
@@ -6416,7 +6427,7 @@ const __scBgKeepAlive = (function() {
             }
             /* 当天复用闸门：一天只在首个执行点真正拉一次热搜词，其余执行点直接复用落盘的词池。
                @crontab 每个执行点都是全新后台上下文、内存必清零，但 cache 由 GM 持久化跨上下文存活。
-               旧代码没有这道闸门：每个执行点都 force=true 重打 16+3 个接口，一天 10~20 轮就是几百次请求。
+               旧代码没有这道闸门：每个执行点都 force=true 重打 16+3 个接口，一天 5~8 轮就是上百次请求。
                判定用「日期号」而不是 TTL：热搜一天内变化不大，当天拉过就够用，跨天自然重拉。
                注意：只有「确实从接口拿到词」才会记 date（见本函数末尾），全挂+随机补足的那次不记，
                留给下一轮再试真接口。 */
@@ -8141,10 +8152,26 @@ const __scBgKeepAlive = (function() {
     };
 
     const ROUND_BUDGET_MS = 20 * 60 * 1000;
-    /* 收工前最后一轮的预算上限：20 分钟一轮的最后一轮塞不下欠的搜索，
-       18:00 一到浏览器就被关闭，没做完的搜索只能丢到明天（跨天清零）。
-       所以最后一个执行点允许把预算放宽到「离收工还剩多久」，最多这么多。 */
-    const ROUND_LAST_BUDGET_MS = 45 * 60 * 1000;
+    /* 收工前最后一轮的预算上限：末轮塞不下欠的搜索，收工一到浏览器就被关闭，
+       没做完的搜索只能丢到明天（跨天清零）。所以最后一个执行点允许把预算放宽到
+       「离收工还剩多久」，最多这么多。
+       v0.79：改成 60 分钟 = 一串节点（3 × 20）+ 两次节点间隔，与 runNodes 的总上限一致；
+       以前 45 分钟是针对「一轮只干 20 分钟」的补偿。 */
+    const ROUND_LAST_BUDGET_MS = 60 * 60 * 1000;
+
+    /* ══ 节点式执行（v0.79）═════════════════════════════════════════════
+       用户要求（2026-11-22）：
+         ① 轮询节奏还是 20 分钟 —— 一个节点就是一个 20 分钟窗口（ROUND_BUDGET_MS）；
+         ② 任务一直做别停 —— 节点做完立刻接下一个节点，中间只停「节点间隔」；
+         ③ 每个节点开头先盘点还剩什么任务，已完成的直接跳过，不重复做；
+         ④ 搜索 / 阅读不混在同一个节点：要么整节点全搜索，要么整节点全阅读；
+         ⑤ 其他活动（桌面周任务 / 月度 / 活动卡 / 连签 / 每日活动 / 国际版 /
+            领奖 / 二次扫描 / Edge）在一次节点里全部做完。
+       节点间隔默认 60~180 秒随机（Config.nodeGapMin / nodeGapMax）。 */
+    const NODE_GAP_FALLBACK = [60 * 1000, 180 * 1000];
+    /* 一轮总时长上限：节点会一直串下去，这里只防「卡在某个不会返回的请求上」时
+       把上下文永远占住。取运行窗口剩余时间的上限，最少 60 分钟。 */
+    const ROUND_TOTAL_MAX = 6 * 60 * 60 * 1000;
 
     const SEARCH_PACER = {
         /* ── 两套间隔基准，都在脚本顶部的 UserConfig 里配，不用改代码 ──
@@ -8333,9 +8360,10 @@ const __scBgKeepAlive = (function() {
                还可能继续往下走，它的心跳不能把新一轮的标记覆盖掉。 */
             if (this.roundId !== this.roundSeq) return false;
             const now = Date.now();
-            /* 硬上限跟着本轮预算走：最后一轮预算被放宽到 45 分钟时，
-               硬上限也必须同步放宽，否则心跳会把还在正常跑的长轮强杀。 */
-            const hardLimit = (this.roundBudget || ROUND_BUDGET_MS) + 20 * 60 * 1000;
+            /* 硬上限：v0.79 起一轮由多个节点串起来（每节点 20 分钟 + 节点间隔），
+               总时长不再等于 ROUND_BUDGET_MS。这里用「一轮总上限 + 10 分钟余量」，
+               卡死由下面的 ROUND_STALL（15 分钟没进展）负责兜底，不会拖一整天。 */
+            const hardLimit = ROUND_TOTAL_MAX + 10 * 60 * 1000;
             if (now - (this.runningSince || now) > hardLimit) {
                 const msg = this.abortRound
                     ? ""
@@ -8514,6 +8542,8 @@ const __scBgKeepAlive = (function() {
             this.abortRound = false;
             try { Utils.releaseLock("Config.runLock"); } catch (_) {}
             try { Sched.state("done"); } catch (_) {}
+            /* 18 点后的 20 分钟节拍从「这一轮结束」起算（见 hitWakePoint 的 continuous 分支）。 */
+            try { GM_setValue(ROUND_END_KEY, Date.now()); } catch (_) {}
             if (reason) Utils.log("🔴", reason);
             if (released.length > 0) {
                 Utils.log("🧹", `本轮已释放 ${released.length} 组状态：${released.join("、")}（下一轮从干净状态开始）`);
@@ -8608,7 +8638,9 @@ const __scBgKeepAlive = (function() {
         },
 
         async doRead(roundDeadline) {
-            if (!GM_getValue("Tasks.read", true) || this.readTimes > 2) return;
+            /* 次数上限放到 6：节点模式下阅读会连续占多个节点（「要么全阅读」），
+               原来 >2 就在第二轮直接 return，会被节点循环误判成「没进展」。 */
+            if (!GM_getValue("Tasks.read", true) || this.readTimes > 6) return;
             if (this.readDate === RewardsAuto.state.dateNowNum) {
                 const verifyProgress = await API.getReadProgress();
                 if (verifyProgress && verifyProgress.progress >= verifyProgress.max) {
@@ -8649,14 +8681,17 @@ const __scBgKeepAlive = (function() {
             const target = Math.min(Math.max(Math.ceil((max - cur) / pointsPerArticle), 1), maxPerDay);
             Utils.log("📖", `今日还可阅读 ${target} 篇（上限 ${maxPerDay} 篇/天，每篇约 ${pointsPerArticle} 分）`);
             let gap = SEARCH_PACER.startGap("other");
-            const readCap = Date.now() + 8 * 60 * 1000;
+            /* v0.79：阅读节点独占整个 20 分钟窗口。
+               以前这里还叠了个 8 分钟上限，10 篇（每篇一个 otherSpan 节拍）根本读不完，
+               每次都「到点交班，还剩 N 篇」—— 一天下来阅读永远差几篇。 */
+            const readCap = Date.now() + ROUND_BUDGET_MS;
             const readDeadline = (Number(roundDeadline) || 0) > 0 ? Math.min(Number(roundDeadline), readCap) : readCap;
             let successCount = 0;
             let stagnant = 0;
             for (let i = 0; i < target; i++) {
                 this.tick();
                 if (!SEARCH_PACER.fits(readDeadline, gap)) {
-                    Utils.log("🟡", `阅读到点交班，还剩 ${target - i} 篇交给下一轮（当前节拍 ${Math.round(gap / 1000)} 秒）`);
+                    Utils.log("🟡", `阅读节点到点，还剩 ${target - i} 篇交给下一个阅读节点继续（当前节拍 ${Math.round(gap / 1000)} 秒）`);
                     break;
                 }
                 await SEARCH_PACER.beat(gap);
@@ -8735,11 +8770,21 @@ const __scBgKeepAlive = (function() {
 
         async doDesktopWeekly() {
             if (!GM_getValue("Tasks.desktopWeekly", true)) return true;
+            /* 今天已经确认「没有待办 + 没有读失败的入口」：跳过。
+               周任务是按天解锁的（每天一张），所以标记按天存，明天自动重查。 */
+            if ((Number(GM_getValue("Config.desktopWeekDoneDate", 0)) || 0) === Utils.getTodayNum()) {
+                Utils.log("✅", "桌面专属任务今日已完成，跳过（不重复提交）");
+                return true;
+            }
             try {
                 const weekly = await API.runDesktopWeeklyQuests();
                 RewardsAuto.state.weeklyQuestDone = weekly.done || 0;
                 RewardsAuto.state.weeklyQuestPending = weekly.pending || 0;
                 RewardsAuto.state.weeklyQuestFailed = weekly.failed || 0;
+                if (!weekly.pending && !weekly.failed) {
+                    GM_setValue("Config.desktopWeekDoneDate", Utils.getTodayNum());
+                    Utils.log("✅", "桌面专属任务今日全部完成，今天不再重复提交");
+                }
                 return true;
             } catch (e) {
                 Utils.log("🟡", `桌面专属任务异常：${e && e.message ? e.message : e}`);
@@ -8754,6 +8799,15 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.monthlyPending = 0;
                 return true;
             }
+            /* 今日已确认全部完成：不再重复请求（用户要求「做完的不要重复做」）。
+               标记只在 complete=true 那一刻写，失败/读不到一律不写，避免整天被跳过。 */
+            const today = Utils.getTodayNum();
+            if ((Number(GM_getValue("Config.monthlyDoneDate", 0)) || 0) === today) {
+                RewardsAuto.state.monthlyComplete = true;
+                RewardsAuto.state.monthlyPending = 0;
+                Utils.log("✅", "月度计划今日已完成，跳过（不重复请求）");
+                return true;
+            }
             try {
                 const res = await API.runMonthlyPlan();
                 RewardsAuto.state.monthlyFound = res.found || 0;
@@ -8761,6 +8815,7 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.monthlyTotal = res.total || 0;
                 RewardsAuto.state.monthlyPending = res.pending || 0;
                 RewardsAuto.state.monthlyComplete = !!res.complete;
+                if (res.complete) GM_setValue("Config.monthlyDoneDate", today);
                 return true;
             } catch (e) {
                 Utils.log("🟡", `月度计划异常：${e && e.message ? e.message : e}`);
@@ -8769,7 +8824,9 @@ const __scBgKeepAlive = (function() {
         },
 
         async doPromos(roundDeadline) {
-            if (!GM_getValue("Tasks.promos", true) || this.promosTimes > 2) return true;
+            /* 同 doRead：节点模式下其他活动节点可能连进两次，放宽到 6 次；
+               真正的幂等靠 promosDate（今日已完成直接跳过）。 */
+            if (!GM_getValue("Tasks.promos", true) || this.promosTimes > 6) return true;
             if (this.promosDate === RewardsAuto.state.dateNowNum) {
                 Utils.log("✅", "活动卡片已完成");
                 return true;
@@ -8957,11 +9014,12 @@ const __scBgKeepAlive = (function() {
             let peakGap = 0;
             let lastStart = 0;
             const needed = Math.max(1, Math.ceil((max - progress) / 3));
-            /* 「把搜索随机分散到一天」：本轮份额不是「还差 ÷ 剩余轮数」的等分，
-               而是围绕平均值随机抽样（多数轮少搜几次，偶尔一轮猛搜，还可能整轮
-               跳过）。下一轮用最新 progress 重算平均值，所以随机不会跑偏。
-               Config.spread=0 退回旧行为：一轮做多少算多少。 */
-            const spreadOn = GM_getValue("Config.spread", true) !== false;
+            /* v0.79：节点化之后不再「分散到全天」。
+               用户要求「任务一直做别停、一个节点要么全搜索要么全阅读」——
+               搜索节点会把整个 20 分钟窗口都用来搜索，直到配额满或节点到点；
+               再按「剩余轮数随机分摊 / 可能整轮跳过」就等于自己给自己刹车。
+               Config.spread 保留在面板上只为兼容老配置，节点模式下不生效。 */
+            const spreadOn = false;
             const roundsLeft = spreadOn ? Sched.roundsLeftToday() : 1;
             const roundTarget = spreadOn ? SEARCH_PACER.pickShare(needed, roundsLeft) : needed;
             if (spreadOn && roundTarget <= 0) {
@@ -8986,7 +9044,7 @@ const __scBgKeepAlive = (function() {
             const usedQueries = new Set();
             const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
 
-            Utils.log("🔍", `单轮搜索 ${deadlineMin} 分钟（到点交班，未做完的配额留到下一次定时唤醒），`
+            Utils.log("🔍", `搜索节点 ${deadlineMin} 分钟（到点交给下一个搜索节点继续，配额不会丢），`
                 + `间隔每次随机 ${Math.round(SEARCH_PACER.cycleMin() / 1000)}~${Math.round(SEARCH_PACER.cycleMax() / 1000)} 秒`
                 + `（基准 ${Math.round(gap / 1000)} 秒，偶尔来一次长停顿），还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`
                 + (spreadOn ? `；今天还剩 ${roundsLeft} 轮唤醒，本轮随机分到 ${roundTarget} 次` : ""));
@@ -9144,6 +9202,14 @@ const __scBgKeepAlive = (function() {
 
         async doDailySet(roundDeadline) {
             const today = Utils.getTodayNum();
+            /* 今日已确认无未完成日常卡：直接跳过（用户要求「做完的不要重复做」）。
+               这个标记只在 remain === 0（服务端确认）时写；有锁定卡或未完成卡时
+               写的是 0，所以这里不会把「还有锁定卡」误判成完成。 */
+            if ((Number(GM_getValue("Config.dailySetDoneDate", 0)) || 0) === today) {
+                Utils.log("✅", "每日活动今日已完成，跳过（不重复发现/领取）");
+                RewardsAuto.state.dailySetSkipped = true;
+                return true;
+            }
             const todayStr = Utils.getTodayStr();
             const processedKey = "Config.dailySetProcessed";
             let processed = GM_getValue(processedKey, []);
@@ -9285,11 +9351,26 @@ const __scBgKeepAlive = (function() {
                 Utils.log("✅", "自动领取待领积分已关闭（Config：Tasks.claimPoints）");
                 return;
             }
+            /* 刚确认过「待领为 0」就别再打一次（节点模式下 other 节点会连续进，
+               每次领奖都要走 dashboard + 通道探测，30 分钟内重复没有意义）。
+               只有「确认清空」才写标记 —— 未成功/待复核不写，避免把失败的当成做完。 */
+            const claimToday = Utils.getTodayNum();
+            const markClean = () => {
+                try { GM_setValue("Config.claimCleanAt", { date: claimToday, at: Date.now() }); } catch (_) {}
+            };
+            const clean = GM_getValue("Config.claimCleanAt", null);
+            if (clean && Number(clean.date) === claimToday && (Date.now() - (Number(clean.at) || 0)) < 30 * 60 * 1000) {
+                this.claimSummary = "✅ 待领为 0";
+                this.claimReason = "";
+                Utils.log("✅", `待领积分 ${Math.round((Date.now() - Number(clean.at)) / 60000)} 分钟前刚确认清空，跳过`);
+                return;
+            }
             try {
                 try { await Utils.getCookieHeader(); } catch (_) {}
                 const res = await ClaimPoints.run();
 
                 if (res.claimed > 0) {
+                    if (res.empty) markClean();
                     /* 播报口径：只有「余额真的涨了」才敢说已领取多少分。
                        余额差读不到时，res.claimed 是按页面待领额估算的，
                        以前会写成「已自动领取 9334 积分（当前余额 18602）」——
@@ -9313,12 +9394,14 @@ const __scBgKeepAlive = (function() {
                     return;
                 }
                 if (res.nothingToClaim) {
+                    markClean();
                     this.claimSummary = "✅ 待领为 0";
                     this.claimReason = "";
                     Utils.log("✅", res.reason || "待领为 0，无需领取");
                     return;
                 }
                 if (res.settled) {
+                    markClean();
                     this.claimSummary = "✅ 已领取 · 池已清空";
                     this.claimReason = "";
                     Utils.log("🎁", res.reason || "已领取，待领池已清空");
@@ -9435,8 +9518,20 @@ const __scBgKeepAlive = (function() {
         },
 
         async doStreak() {
+            /* 今日连签已确认全部完成：直接跳过（不重复拉推广表 / earn 页）。
+               标记只在「确实看到所有连签项都 done」时写；读不到就照常检查。 */
+            const streakToday = Utils.getTodayNum();
+            if ((Number(GM_getValue("Config.streakDoneDate", 0)) || 0) === streakToday) {
+                Utils.log("✅", "连签今日已完成，跳过（不重复检查）");
+                return;
+            }
             await RegionGuard.guard("连签检测");
             Utils.log("📅", "开始检测连签任务...");
+            /* 所有连签项都完成才写标记。默认 false：只要看到一项没完成就不写，
+               什么都没检测到（页面结构变了）也不写 —— 宁可下一轮再查一次，
+               也不能因为一次误判把一整天跳过。 */
+            let allStreakDone = true;
+            let sawAny = false;
             try {
                 const map = await API.getPromotionMap(true);
                 if (map) {
@@ -9449,7 +9544,9 @@ const __scBgKeepAlive = (function() {
                     const children = [...map.values()].filter(i =>
                         i.offerId.includes(RewardsAuto.appConfig.offerIds.dailySetPrefix) && i.dailySetDate === todayStr);
                     if (children.length > 0) {
+                        sawAny = true;
                         const done = children.filter(i => i.complete).length;
+                        if (done < children.length) allStreakDone = false;
                         Utils.log(done >= children.length ? "✅" : "📅", `每日连续打卡活动：${done}/${children.length} 张已完成`);
                     }
                 }
@@ -9473,8 +9570,10 @@ const __scBgKeepAlive = (function() {
                 for (const { name, pattern } of taskPatterns) {
                     const m = text.match(pattern);
                     if (m) {
+                        sawAny = true;
                         const cur = parseInt(m[1]), max = parseInt(m[2]);
                         const done = cur >= max;
+                        if (!done) allStreakDone = false;
                         Utils.log(done ? "✅" : "📅", `${name}: ${cur}/${max}${done ? " 已完成" : ""}`);
                         if (name === "视觉搜索连续打卡" && !done) visualSearchDone = false;
                     }
@@ -9500,9 +9599,407 @@ const __scBgKeepAlive = (function() {
                     Utils.log("📅", `连签奖励印章进度: ${stampMatch[1]}/12`);
                 }
                 Utils.log("📅", "连签任务检测完成，未完成任务将由活动卡片模块处理");
+                /* 全部完成才落盘：下一轮（可能 20 分钟后）直接跳过，不再重复拉页面 */
+                if (sawAny && allStreakDone) {
+                    GM_setValue("Config.streakDoneDate", streakToday);
+                    Utils.log("✅", "连签全部完成，今日不再重复检查（明天自动恢复）");
+                }
             } catch (e) {
                 Utils.log("🔴", `连签任务异常: ${e.message}`);
             }
+        },
+
+        /* ══ 节点间隔：默认 1~3 分钟随机 ══════════════════════════════════
+           用户要求「延迟 1~3 分钟随机」。放在节点之间而不是每个动作之间：
+           动作之间的节拍由 SEARCH_PACER（Config.span / otherSpan）管，
+           两者叠加起来会变得非常慢。 */
+        nodeGapMs() {
+            let lo = Number(GM_getValue("Config.nodeGapMin", null));
+            let hi = Number(GM_getValue("Config.nodeGapMax", null));
+            if (!Number.isFinite(lo) || lo < 0) lo = NODE_GAP_FALLBACK[0] / 1000;
+            if (!Number.isFinite(hi) || hi < 0) hi = NODE_GAP_FALLBACK[1] / 1000;
+            lo *= 1000;
+            hi *= 1000;
+            if (hi < lo) { const t = lo; lo = hi; hi = t; }
+            if (hi <= 0) return 0;
+            return Utils.randomRange(lo, hi);
+        },
+
+        /* 分段等：每 5 秒确认一次「这一轮还活着」，被强制收尾/锁被接管就立刻抛错退出。
+           一次性 await 3 分钟的话，心跳虽然还在跳，但这段完全没有进度打点，
+           会被「15 分钟没进展」判定误伤。 */
+        async waitNodeGap(label) {
+            const ms = this.nodeGapMs();
+            if (ms <= 0) return;
+            Utils.log("⏳", `${label ? label + "：" : ""}节点间隔 ${(ms / 60000).toFixed(1)} 分钟（${Math.round(ms / 1000)} 秒，1~3 分钟随机）`);
+            const t0 = Date.now();
+            while (Date.now() - t0 < ms) {
+                this.tick();
+                await Utils.delay(Math.min(5000, ms - (Date.now() - t0)));
+            }
+        },
+
+        /* ══ 任务盘点：这一轮还剩什么没做 ════════════════════════════════
+           用户要求「轮询开始先查询还有什么任务没做，做完的不要再重复做」。
+           这里只读接口 + 今天的完成标记，不发任何「做任务」的请求：
+             · 搜索：面板配额（getPcQuota）优先，读不到退回 earn 页
+             · 阅读：earn 页的阅读进度
+             · 其他：全部看本地当天标记，零请求
+           返回值里 search / read 是布尔，other 是待做项的名字数组。 */
+        async surveyTasks() {
+            const today = RewardsAuto.state.dateNowNum || Utils.getTodayNum();
+            const on = (k, d = true) => GM_getValue(k, d) !== false;
+            const out = {
+                search: false, read: false, other: [],
+                pc: null, readP: null, text: "", planText: ""
+            };
+
+            let info = null;
+            try { info = await API.getRewardsInfo(1); } catch (_) { info = null; }
+
+            /* ── 搜索：配额满了就不排搜索节点 ── */
+            let pcTxt = "已关闭";
+            if (on("Tasks.search")) {
+                let cur = NaN, max = NaN;
+                try {
+                    const q = await API.getPcQuota();
+                    if (q && Number(q.max) > 0) { cur = Number(q.progress); max = Number(q.max); }
+                } catch (_) {}
+                if (!Number.isFinite(cur) && info && info.pc) {
+                    cur = Number(info.pc.progress); max = Number(info.pc.max);
+                }
+                out.pc = { progress: cur, max: max };
+                if (Number.isFinite(cur) && Number.isFinite(max) && max > 0) {
+                    out.search = cur < max;
+                    pcTxt = `${cur}/${max}` + (out.search ? `（还差 ${Math.max(0, max - cur)} 分）` : " ✅ 已完成");
+                } else {
+                    /* 读不到配额时不当作完成：交给搜索节点自己再判一次（它会打「读不到就不搜」） */
+                    out.search = true;
+                    out.pc = null;
+                    pcTxt = "配额读不到（交给搜索节点复核）";
+                }
+            }
+
+            /* ── 阅读：进度满了就不排阅读节点 ── */
+            let readTxt = "已关闭";
+            if (on("Tasks.read")) {
+                let rp = NaN, rm = NaN;
+                /* 先问 DAPI：`API.getReadProgress()` 是最权威的（日志里那行
+                   「📊 阅读进度查询: 30/30」就是它）。`getRewardsInfo()` 里的
+                   readProgress 大半是本地缓存，新上下文里还是 0 ——
+                   线上 22:46:36 marvin 盘点报「阅读 0/30」，一秒钟后真查却是 30/30，
+                   于是每轮都被排进一个空的阅读节点，白等 2 分钟。
+                   原来的判断只在「读不到数值」时才补查，0 是合法数值所以永远不补查。 */
+                try {
+                    const p = await API.getReadProgress();
+                    if (p) { rp = Number(p.progress); rm = Number(p.max); }
+                } catch (_) {}
+                if (!Number.isFinite(rp) || !(rm > 0)) {
+                    if (info) { rp = Number(info.readProgress); rm = Number(info.readMax); }
+                }
+                out.readP = { progress: rp, max: rm };
+                if (Number.isFinite(rp) && rm > 0) {
+                    out.read = rp < rm;
+                    readTxt = `${rp}/${rm}` + (out.read ? `（还差 ${Math.max(0, rm - rp)} 分）` : " ✅ 已完成");
+                } else {
+                    out.read = true;
+                    out.readP = null;
+                    readTxt = "进度读不到（交给阅读节点复核）";
+                }
+            }
+
+            /* ── 其他活动：只看当天标记 ── */
+            if (on("Tasks.desktopWeekly")
+                && (Number(GM_getValue("Config.desktopWeekDoneDate", 0)) || 0) !== today) out.other.push("桌面专属任务");
+            if (on("Tasks.monthly") && (Number(GM_getValue("Config.monthlyDoneDate", 0)) || 0) !== today) out.other.push("月度计划");
+            if (on("Tasks.promos") && this.promosDate !== today) out.other.push("活动卡片");
+            if ((Number(GM_getValue("Config.streakDoneDate", 0)) || 0) !== today) out.other.push("连签");
+            if ((Number(GM_getValue("Config.dailySetDoneDate", 0)) || 0) !== today) out.other.push("每日活动");
+            if (on("Tasks.intlDaily")) {
+                const st = GM_getValue("Config.intlDailyDate", null);
+                const done = st && Number(st.date) === today && Number(st.found) > 0 && Number(st.pending) === 0;
+                if (!done) out.other.push("国际版活动");
+            }
+            if (on("Tasks.claimPoints")) {
+                /* 30 分钟内刚确认「待领为 0」就不算待做，否则 other 节点永远清不空 */
+                const cl = GM_getValue("Config.claimCleanAt", null);
+                const fresh = cl && Number(cl.date) === today && (Date.now() - (Number(cl.at) || 0)) < 30 * 60 * 1000;
+                if (!fresh) out.other.push("待领积分");
+            }
+            if (EdgeStreak.enabled()) {
+                const es = (() => { try { return EdgeStreak.summary(); } catch (_) { return null; } })();
+                /* 只放固定名字、不放进度文本：进度每轮都在变，会把「待做项没减少」
+                   误判成「有变化」，防空转的刹车就失效了。 */
+                if (es && !es.done && !es.skipped) out.other.push("Edge 连签");
+            }
+
+            out.text = `搜索 ${pcTxt} · 阅读 ${readTxt}`
+                + (out.other.length ? ` · 待做：${out.other.join(" / ")}` : " · 其他活动 ✅ 全部完成");
+            const plan = [];
+            if (out.search) plan.push("搜索");
+            if (out.read) plan.push("阅读");
+            if (out.other.length) plan.push("其他活动");
+            out.planText = plan.length ? plan.join(" → ") : "无（今天已全部完成）";
+            return out;
+        },
+
+        /* ══ 其他活动节点：一次把这个节点的事全做完 ══════════════════════
+           用户要求「其他活动可以放在一轮直接做完」。
+           每一项内部都自带当天/当周的完成标记：
+             · 活动卡片 → promosDate
+             · 每日活动 → Config.dailySetDoneDate
+             · 国际版   → Config.intlDailyDate
+             · 月度计划 → Config.monthlyDoneDate
+             · 连签     → Config.streakDoneDate
+             · 桌面周任务 → State.desktopWeekAttempted（同一张卡当天只交一次）
+           所以重复进入这个节点也不会重复交卷，只是各项会先打一行「已完成，跳过」。 */
+        async runOtherNode(deadline, wr) {
+            const on = (k, d = true) => GM_getValue(k, d) !== false;
+            const roundExpired = () => Date.now() > deadline;
+
+            if (on("Tasks.desktopWeekly")) {
+                await this.doDesktopWeekly();
+                await Utils.randomDelay(2000, 5000);
+            }
+            if (on("Tasks.monthly")) {
+                if (!roundExpired()) await wr(() => this.doMonthlyPlan(), "月度计划");
+                await Utils.randomDelay(2000, 5000);
+            }
+            if (on("Tasks.promos")) {
+                if (!roundExpired()) {
+                    await wr(() => this.doPromos(deadline), "活动卡片");
+                    await Utils.randomDelay();
+                }
+            }
+            if (!roundExpired()) await this.doStreak();
+            await Utils.randomDelay();
+
+            /* 每日活动 */
+            if (roundExpired()) {
+                Utils.log("🟡", "其他活动节点已到 20 分钟上限，每日活动交给下一个节点");
+            } else {
+                Utils.log("📅", "开始执行每日活动任务...");
+                await Utils.randomDelay();
+                this._dailySetRes = await wr(() => this.doDailySet(deadline), "每日活动");
+            }
+            /* 国际版每日活动：纯接口完成，不占 CDP 也不开标签页 */
+            if (!on("Tasks.intlDaily")) {
+                Utils.log("  ", "国际版每日活动已关闭（任务开关）");
+                this._intlDailyRes = null;
+            } else if (roundExpired()) {
+                Utils.log("🟡", "其他活动节点已到 20 分钟上限，国际版每日活动交给下一个节点");
+            } else {
+                await Utils.randomDelay();
+                this._intlDailyRes = await this.doIntlDaily(deadline);
+            }
+            try {
+                await this.doClaimPoints();
+            } catch (e) {
+                if (e && e.regionBlocked) throw e;
+                Utils.log("🟡", `领取积分执行异常: ${e.message}`);
+            }
+            /* 二次扫描：活动卡已经全部完成时没必要再扫（用户要求「做完的不要重复做」） */
+            if (roundExpired()) {
+                Utils.log("🟡", "其他活动节点已到 20 分钟上限，二次扫描交给下一个节点");
+            } else if (this.promosDate === (RewardsAuto.state.dateNowNum || Utils.getTodayNum())) {
+                Utils.log("✅", "活动卡片今日已完成，二次扫描跳过（不重复扫描）");
+            } else {
+                Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
+                await Utils.randomDelay(3000, 8000);
+                const newCards = await API.discoverCards();
+                if (newCards.length > 0) {
+                    Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
+                    let ok = 0, fail = 0;
+                    let rescanGap = SEARCH_PACER.startGap("other");
+                    for (const card of newCards) {
+                        await RegionGuard.guard("二次扫描");
+                        this.tick();
+                        Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
+                        if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
+                        if (!SEARCH_PACER.fits(deadline, rescanGap)) {
+                            Utils.log("🟡", `二次扫描到点交班，剩余卡片留给下一个节点（当前节拍 ${Math.round(rescanGap / 1000)} 秒）`);
+                            break;
+                        }
+                        await SEARCH_PACER.beat(rescanGap);
+                        const result = await API.claimCard(card);
+                        result ? ok++ : fail++;
+                        rescanGap = SEARCH_PACER.nextGap(rescanGap, !!result, "other");
+                    }
+                    Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
+                } else {
+                    Utils.log("✅", "二次扫描：无新卡片");
+                }
+            }
+            /* 关掉时连「检查」这一步都不做，也别打日志 */
+            if (EdgeStreak.enabled()) {
+                Utils.log("🌐", "检查 Edge 浏览连签进度...");
+                const edgeRes = await EdgePacer.maybeReport();
+                if (!edgeRes) {
+                    Utils.log("  ", "Edge 浏览连签：本轮没有推进（间隔未到 / 未授权 / 出口未通过）");
+                } else if (edgeRes.done) {
+                    Utils.log("  ", "Edge 浏览连签：今日已达标");
+                } else if (edgeRes.skipped) {
+                    Utils.log("  ", "Edge 浏览连签：今日已跳过（账号无此活动或已暂停）");
+                } else {
+                    Utils.log("  ", `Edge 浏览连签：已上报 ${edgeRes.count}/${edgeRes.total} 次，`
+                        + `下次约 ${Math.max(1, Math.round((edgeRes.waitMs || 0) / 60000))} 分钟后`);
+                }
+            }
+        },
+
+        /* ══ 节点循环 ═══════════════════════════════════════════════════
+           一个节点 = 一个 20 分钟窗口，只做一种任务：
+             search → 整节点全搜索（doSearch 内部会一直搜到配额满/节点到点）
+             read   → 整节点全阅读
+             other  → 其他活动一次全做完
+           节点之间停 1~3 分钟。只要盘点还有待做项就继续接下一个节点，
+           直到「盘点为空」或「总时长上限」或「连续两个节点都没进展」。 */
+        async runNodes(ctx) {
+            const wr = ctx.withRetry;
+            const startedAt = Date.now();
+            const planDeadline = Number(ctx.roundDeadline) || (startedAt + ROUND_BUDGET_MS);
+            let totalLimit = Math.max(60 * 60 * 1000, Math.min(ROUND_TOTAL_MAX, planDeadline - startedAt));
+            /* 但不能越过收工线：zy.py 到 untilMin 会直接关浏览器，正在进行的
+               「阅读文章 3/4」「第 N 次搜索」会被腰斩 —— 那一条正好白丢。
+               v0.78 靠「末点 17:40 + 20 分钟 = 18:00」自然对齐；v0.79 一轮拉到
+               60 分钟后，17:20 命中就会跑到 18:20，所以这里夹一次。
+               18 点后同样要夹：zy.py 顺延到 23:59 时，23:30 开跑 60 分钟就会被强杀。
+               untilMin 若已是过去的时刻（如 18:00 而现在 22:00），条件不成立，不夹。 */
+            try {
+                const d0 = new Date(startedAt);
+                const curMin0 = d0.getHours() * 60 + d0.getMinutes();
+                const hint = this.planRaw();
+                const untilMin = hint ? Number(hint.untilMin) : NaN;
+                if (Number.isFinite(untilMin) && untilMin > curMin0) {
+                    const leftMs = (untilMin - curMin0) * 60 * 1000;
+                    if (leftMs < totalLimit) {
+                        totalLimit = Math.max(ROUND_BUDGET_MS, leftMs);
+                        Utils.log("⏳", `离收工（${this.fmtHM(untilMin)}）还有 ${Math.round(leftMs / 60000)} 分钟，`
+                            + `本轮节点循环按这个长度收缩，不再套 60 分钟（避免收工那一刻被强杀）`);
+                    }
+                }
+            } catch (_) {}
+            const totalDeadline = startedAt + totalLimit;
+
+            let surv = await this.surveyTasks();
+            Utils.log("🧾", `任务盘点：${surv.text}`);
+            Utils.log("🧭", `本轮节点计划：${surv.planText}`
+                + `（每个节点最多 ${Math.round(ROUND_BUDGET_MS / 60000)} 分钟，节点之间停 1~3 分钟）`);
+
+            const stuck = { search: 0, read: 0, other: 0 };
+            const off = { search: false, read: false, other: false };
+            let prevPc = surv.pc ? surv.pc.progress : null;
+            let prevRead = surv.readP ? surv.readP.progress : null;
+            let prevOther = surv.other.join("|");
+            let nodeIdx = 0;
+            /* 本轮「有没有真的推进」的基准：只有推进过才允许写续跑标记，
+               否则锁定卡/风控会让「还有待做项」一直成立，变成无意义的空转连跑。 */
+            const firstPc = prevPc;
+            const firstRead = prevRead;
+            const firstOther = surv.other.length;
+
+            while (true) {
+                this.tick();
+                if (Date.now() >= totalDeadline) {
+                    Utils.log("🟡", `本轮已到总时长上限 ${Math.round(totalLimit / 60000)} 分钟，剩余任务交给下一轮`);
+                    break;
+                }
+                const pendingSearch = surv.search && !off.search;
+                const pendingRead = surv.read && !off.read;
+                const pendingOther = surv.other.length > 0 && !off.other;
+                if (!pendingSearch && !pendingRead && !pendingOther) {
+                    if (surv.search || surv.read || surv.other.length) {
+                        Utils.log("🟡", "剩余项本轮无法推进（已在节点里判过），交给下一轮重新盘点");
+                    } else {
+                        Utils.log("✅", "盘点结果：今日任务已全部完成，本轮不再重复执行任何节点");
+                    }
+                    break;
+                }
+
+                const type = pendingSearch ? "search" : (pendingRead ? "read" : "other");
+                if (nodeIdx > 0) await this.waitNodeGap(type === "search" ? "搜索" : (type === "read" ? "阅读" : "其他活动"));
+                const nodeDeadline = Math.min(Date.now() + ROUND_BUDGET_MS, totalDeadline);
+                nodeIdx++;
+                Utils.log("🚦", `进入${type === "search" ? "搜索" : (type === "read" ? "阅读" : "其他活动")}节点`
+                    + `（第 ${nodeIdx} 个，最多 ${Math.round((nodeDeadline - Date.now()) / 60000)} 分钟）`);
+
+                if (type === "search") {
+                    await wr(() => this.doSearch(nodeDeadline), "搜索");
+                } else if (type === "read") {
+                    await wr(() => this.doRead(nodeDeadline), "阅读");
+                } else {
+                    await this.runOtherNode(nodeDeadline, wr);
+                }
+
+                /* 节点后重新盘点：这是「轮询开始先查询」的另一半 ——
+                   做完的项立刻从计划里消失，下一节点不会再碰它。 */
+                this.tick();
+                surv = await this.surveyTasks();
+                Utils.log("🧾", `节点后盘点：${surv.text}`);
+
+                if (type === "search") {
+                    const now = surv.pc ? surv.pc.progress : null;
+                    const moved = prevPc != null && now != null && Number(now) > Number(prevPc);
+                    stuck.search = moved ? 0 : stuck.search + 1;
+                    prevPc = now;
+                    if (stuck.search >= 2) {
+                        off.search = true;
+                        Utils.log("🟡", "连续两个搜索节点配额都没涨（可能在冷却/限流），搜索交给下一轮，先做别的");
+                    }
+                } else if (type === "read") {
+                    const now = surv.readP ? surv.readP.progress : null;
+                    const moved = prevRead != null && now != null && Number(now) > Number(prevRead);
+                    stuck.read = moved ? 0 : stuck.read + 1;
+                    prevRead = now;
+                    if (stuck.read >= 2) {
+                        off.read = true;
+                        Utils.log("🟡", "连续两个阅读节点进度都没涨，阅读交给下一轮，先做别的");
+                    }
+                } else {
+                    const key = surv.other.join("|");
+                    stuck.other = (key !== prevOther) ? 0 : stuck.other + 1;
+                    prevOther = key;
+                    if (stuck.other >= 2) {
+                        off.other = true;
+                        Utils.log("🟡", "连续两个其他活动节点都没有减少待做项（多为锁定卡/风控），本轮不再重复跑");
+                    }
+                }
+            }
+
+            /* ── 本轮收尾：18 点前还有没做完的，就留一个「续跑」标记 ──
+               18 点前执行点之间隔着 70 分钟、一轮 60 分钟，只空 10 分钟；
+               留标记让下一声敲门直接接着做，不用干等。
+               18 点后不走这里：那边统一按 20 分钟节拍（见 hitWakePoint 的 continuous 分支），
+               每分钟续跑就是「胡跑」的来源。 */
+            const stillPending = surv.search || surv.read || surv.other.length > 0;
+            const after18Now = (() => {
+                const d = new Date();
+                return d.getHours() * 60 + d.getMinutes() >= PLAN_CUTOFF_MIN;
+            })();
+            let progressed = false;
+            try {
+                const nowPc = surv.pc ? Number(surv.pc.progress) : null;
+                const nowRead = surv.readP ? Number(surv.readP.progress) : null;
+                progressed = (firstPc != null && nowPc != null && nowPc > firstPc)
+                    || (firstRead != null && nowRead != null && nowRead > firstRead)
+                    || (surv.other.length < firstOther);
+            } catch (_) {}
+            try {
+                if (stillPending && progressed && !after18Now) {
+                    GM_setValue("Config.needMore", { date: Utils.getTodayNum(), at: Date.now() });
+                    Utils.log("🔁", `本轮结束时仍有待做（${surv.other.join(" / ") || (surv.search ? "搜索" : "阅读")}），`
+                        + `已留下续跑标记：下一声敲门直接接着做（不占执行点）`);
+                } else if (stillPending && after18Now) {
+                    GM_setValue("Config.needMore", null);
+                    Utils.log("🟡", `18 点后仍有待做（${surv.other.join(" / ") || (surv.search ? "搜索" : "阅读")}），`
+                        + `按 20 分钟节拍继续（下一轮在 ${Math.round(AFTER18_IDLE_MS / 60000)} 分钟后）`);
+                } else if (!stillPending) {
+                    GM_setValue("Config.needMore", null);
+                } else {
+                    GM_setValue("Config.needMore", null);
+                    Utils.log("🟡", "本轮没有实际推进（配额/进度都没动），不写续跑标记，等下一次定时唤醒");
+                }
+            } catch (_) {}
         },
 
         async runAll(opts) {
@@ -9549,9 +10046,7 @@ const __scBgKeepAlive = (function() {
                 return;
             }
             if (!force && !Sched.inWindow(Date.now())) {
-                const wc = Sched.winCfg();
-                const span = wc.allDay ? "全天不限" : `${Sched.fmtHM(wc.startMin)}~${Sched.fmtHM(wc.endMin)}`;
-                Utils.log("🌙", `当前不在运行时段（${span}），本轮不发请求；要强行跑请用菜单「🚀 立即运行」`);
+                Utils.log("🌙", `当前不在运行时段（${Sched.winSpan()}），本轮不发请求；要强行跑请用菜单「🚀 立即运行」`);
                 Sched.saveNext(Sched.alignToWindow(Date.now()));
                 Sched.clearClaim();
                 Sched.state("waiting", { runAt: Sched.alignToWindow(Date.now()), inWindow: false });
@@ -9568,10 +10063,12 @@ const __scBgKeepAlive = (function() {
             /* 每轮把「面板填的时段 / 实际解析出的时段 / 此刻在不在窗口」打一行，
                排查时段问题不用再翻代码。 */
             try {
-                const wc = Sched.winCfg();
                 const rawWin = GM_getValue("Config.winTime", null);
-                const span = wc.allDay ? "全天不限" : `${Sched.fmtHM(wc.startMin)}~${Sched.fmtHM(wc.endMin)}`;
-                Utils.log("🕘", `本轮生效时段：${span}（配置值 ${rawWin == null ? "未设置" : JSON.stringify(rawWin)}，当前${Sched.inWindow(Date.now()) ? "在" : "不在"}时段内）`);
+                const cw = Sched.winCfg();
+                const cfgTxt = cw.planUsed
+                    ? `计划优先，配置值 ${rawWin == null ? "未设置" : JSON.stringify(rawWin)} 不参与`
+                    : `配置值 ${rawWin == null ? "未设置(→09:00-23:00 兜底)" : JSON.stringify(rawWin)}`;
+                Utils.log("🕘", `本轮生效时段：${Sched.winSpan()}（${cfgTxt}，当前${Sched.inWindow(Date.now()) ? "在" : "不在"}时段内）`);
             } catch (_) {}
             this.roundSeq++;
             this.roundId = this.roundSeq;
@@ -9583,9 +10080,18 @@ const __scBgKeepAlive = (function() {
             const roundBudget = Sched.roundBudgetMs();
             this.roundBudget = roundBudget;
             const roundDeadline = this.runningSince + roundBudget;
-            if (roundBudget > ROUND_BUDGET_MS) {
-                Utils.log("🕒", `今天最后一个执行点：本轮预算放宽到 ${Math.round(roundBudget / 60000)} 分钟`
-                    + `（平时 ${ROUND_BUDGET_MS / 60000} 分钟），把欠的搜索在收工前做完`);
+            {
+                const d0 = new Date(this.runningSince);
+                const curMin0 = d0.getHours() * 60 + d0.getMinutes();
+                if (curMin0 >= PLAN_CUTOFF_MIN) {
+                    /* 18 点后没有执行点这个概念了，别再打「今天最后一个执行点」——
+                       22:06~22:14 那份日志里每 2 分钟就冒一句，看着像排程出了问题。 */
+                    Utils.log("🕒", `18 点后连续模式：本轮预算 ${Math.round(roundBudget / 60000)} 分钟`
+                        + `（${Math.round(AFTER18_IDLE_MS / 60000)} 分钟节拍；盘点为空就直接收尾，没做完按节拍继续）`);
+                } else if (roundBudget > ROUND_BUDGET_MS) {
+                    Utils.log("🕒", `今天最后一个执行点：本轮预算放宽到 ${Math.round(roundBudget / 60000)} 分钟`
+                        + `（平时 ${ROUND_BUDGET_MS / 60000} 分钟），把欠的搜索在收工前做完`);
+                }
             }
             try {
                 this.signTimes = 0;
@@ -9620,6 +10126,21 @@ const __scBgKeepAlive = (function() {
                     Utils.notifyAnomaly("🟡", "Token失败，跳过签入/阅读", "tokenFail");
                 } else {
                     Utils.resetOnce("tokenFail");
+                }
+                /* ══ 轻量闸门（v0.80）══════════════════════════════════════
+                   「胡跑」的另一半：18 点后每 20 分钟一轮，每轮照旧做签入 → 读余额 →
+                   扫桌面任务 → 月度 → 连签 → 每日活动 → 国际版 → 领奖 → 二次扫描 → Edge，
+                   哪怕这些任务几小时前就全做完了。一轮 25~40 秒、十几次接口，纯空转。
+                   这里先盘点（只读 2~3 个接口）：全空就直接收尾，连签入、读余额、CDP 都不碰。 */
+                let preSurv = null;
+                if (isTokenOK) {
+                    try { preSurv = await this.surveyTasks(); } catch (_) { preSurv = null; }
+                }
+                if (preSurv && !preSurv.search && !preSurv.read && preSurv.other.length === 0) {
+                    Utils.log("✅", `盘点：${preSurv.text}`);
+                    Utils.log("💤", "今日任务已全部完成，本轮不执行任何节点"
+                        + "（签入/领奖/CDP 也不再重跑，等下一个节拍复查）");
+                    return;
                 }
                 /* 必须排在 renewToken 之后：换 Token 前打 DAPI 一律 401，
                    余额只会读出 0 —— 「初始积分: 0」既误导人，也让本轮「今日获取」算不出来。 */
@@ -9660,102 +10181,25 @@ const __scBgKeepAlive = (function() {
                 } catch (_) {}
                 await withRetry(() => this.doSign(), "签到");
                 await Utils.randomDelay();
-                /* ⚠ 搜索必须排在阅读/活动卡片之前：搜索是「每日配额硬卡」
-                   （PC 150 分 ≈ 50 次，一次 1~2 分钟，一轮 20 分钟只够十来次），
-                   而且要跨好几轮才做得完。排在后面的话，阅读和活动卡片先吃掉整轮预算，
-                   搜索永远轮不到 —— 这就是「跑了一整天、搜索却没完成」的成因。
-                   阅读同样受 roundDeadline 约束，多做一轮不会丢；搜索丢了就跨天清零。 */
+                /* ══ 节点式执行（v0.79）══════════════════════════════════════
+                   用户要求（2026-11-22）：
+                     · 轮询还是 20 分钟：一个节点就是一个 20 分钟窗口；
+                     · 任务一直做别停：节点做完立刻接下一个，只停 1~3 分钟；
+                     · 每个节点开头先盘点，做完的项直接跳过、不重复做；
+                     · 搜索 / 阅读不混在同一个节点：整节点全搜索，或整节点全阅读；
+                     · 其他活动（桌面周任务/月度/活动卡/连签/每日活动/国际版/
+                       领奖/二次扫描/Edge）在一次节点里全部做完。
+                   签到留在节点循环之前：它一天只有一次且很快，不该占一个节点。 */
+                this._dailySetRes = null;
+                this._intlDailyRes = null;
                 if (isTokenOK) {
-                    await withRetry(() => this.doSearch(roundDeadline), "搜索");
-                    await Utils.randomDelay();
-                }
-                if (isTokenOK) {
-                    if (RewardsAuto.state.pc401) {
-                        Utils.log("🟡", "PC 会话不可用（只影响 PC 通道任务），阅读改用 App 通道继续执行");
-                    }
-                    await withRetry(() => this.doRead(roundDeadline), "阅读");
-                    await Utils.randomDelay();
-                }
-
-                await this.doDesktopWeekly();
-                await Utils.randomDelay();
-                await withRetry(() => this.doMonthlyPlan(), "月度计划");
-                await Utils.randomDelay();
-                await withRetry(() => this.doPromos(roundDeadline), "活动卡片");
-                await Utils.randomDelay();
-                await withRetry(() => this.doStreak(), "连签检测");
-                const roundExpired = () => Date.now() > roundDeadline;
-                const skipByDeadline = name => Utils.log("🟡", `本轮已到 ${Math.round(roundBudget / 60000)} 分钟上限，${name}交给下一轮`);
-                await Utils.randomDelay();
-                let dailySetRes = null;
-                if (roundExpired()) {
-                    skipByDeadline("每日活动");
+                    await this.runNodes({ withRetry, roundDeadline });
                 } else {
-                    Utils.log("📅", "开始执行每日活动任务...");
-                    await Utils.randomDelay();
-                    dailySetRes = await withRetry(() => this.doDailySet(roundDeadline), "每日活动");
+                    Utils.log("🟡", "Token 不可用：只做不依赖 Token 的其他活动（每日活动/签入之外的项）");
+                    await this.runOtherNode(Math.min(Date.now() + ROUND_BUDGET_MS, roundDeadline), withRetry);
                 }
-                /* 国际版每日活动：必应面板里那 5 张卡，纯接口完成，不占 CDP 也不开标签页 */
-                let intlDailyRes = null;
-                if (!GM_getValue("Tasks.intlDaily", true)) {
-                    Utils.log("  ", "国际版每日活动已关闭（任务开关）");
-                } else if (roundExpired()) {
-                    skipByDeadline("国际版每日活动");
-                } else {
-                    await Utils.randomDelay();
-                    intlDailyRes = await this.doIntlDaily(roundDeadline);
-                }
-                try {
-                    await this.doClaimPoints();
-                } catch (e) {
-                    if (e && e.regionBlocked) throw e;
-                    Utils.log("🟡", `领取积分执行异常: ${e.message}`);
-                }
-                if (roundExpired()) {
-                    skipByDeadline("二次扫描");
-                } else {
-                    Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
-                    await Utils.randomDelay(3000, 8000);
-                    const newCards = await API.discoverCards();
-                    if (newCards.length > 0) {
-                        Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
-                        let ok = 0, fail = 0;
-                        let rescanGap = SEARCH_PACER.startGap("other");
-                        for (const card of newCards) {
-                            await RegionGuard.guard("二次扫描");
-                            this.tick();
-                            Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
-                            if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
-                            if (!SEARCH_PACER.fits(roundDeadline, rescanGap)) {
-                                Utils.log("🟡", `二次扫描到点交班，剩余卡片留给下一轮（当前节拍 ${Math.round(rescanGap / 1000)} 秒）`);
-                                break;
-                            }
-                            await SEARCH_PACER.beat(rescanGap);
-                            const result = await API.claimCard(card);
-                            result ? ok++ : fail++;
-                            rescanGap = SEARCH_PACER.nextGap(rescanGap, !!result, "other");
-                        }
-                        Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
-                    } else {
-                        Utils.log("✅", "二次扫描：无新卡片");
-                    }
-                }
-                /* 关掉时连「检查」这一步都不做，也别打日志：
-                   以前无条件执行，开关关着照样看到 Edge 输出，看起来像没生效。 */
-                if (EdgeStreak.enabled()) {
-                    Utils.log("🌐", "检查 Edge 浏览连签进度...");
-                    const edgeRes = await EdgePacer.maybeReport();
-                    if (!edgeRes) {
-                        Utils.log("  ", "Edge 浏览连签：本轮没有推进（间隔未到 / 未授权 / 出口未通过）");
-                    } else if (edgeRes.done) {
-                        Utils.log("  ", "Edge 浏览连签：今日已达标");
-                    } else if (edgeRes.skipped) {
-                        Utils.log("  ", "Edge 浏览连签：今日已跳过（账号无此活动或已暂停）");
-                    } else {
-                        Utils.log("  ", `Edge 浏览连签：已上报 ${edgeRes.count}/${edgeRes.total} 次，`
-                            + `下次约 ${Math.max(1, Math.round((edgeRes.waitMs || 0) / 60000))} 分钟后`);
-                    }
-                }
+                const dailySetRes = this._dailySetRes;
+                const intlDailyRes = this._intlDailyRes;
                 /* CDP 收尾（整轮唯一出口）：把本轮自己开的临时标签页全部关掉。
                    只有「活动卡全清 + 首页待领取也过」才封盘到今天结束；
                    否则下一轮（可能 20 分钟后）还允许再开一次。 */
@@ -9809,7 +10253,11 @@ const __scBgKeepAlive = (function() {
                     const searchOk = info.pc.progress >= info.pc.max;
                     const promosOk = this.promosDate === today;
                     const promosUnknown = !!RewardsAuto.state.promosUnknown && !promosOk;
-                    const dailyOk = !!dailySetRes;
+                    /* 每日活动：本轮没进 other 节点（盘点已判定完成）也算达标 ——
+                       否则「今天早就做完了」会因为 dailySetRes=null 被算成差一项，
+                       每轮都重复跑一遍其他活动节点。 */
+                    const dailyOk = !!dailySetRes
+                        || (Number(GM_getValue("Config.dailySetDoneDate", 0)) || 0) === today;
                     /* 国际版每日活动是额外 25 分，不参与「全部完成」判定，只做展示。
                        intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（封盘/关闭）。 */
                     const intlOk = !GM_getValue("Tasks.intlDaily", true) || intlDailyRes !== false;
@@ -9982,7 +10430,7 @@ const __scBgKeepAlive = (function() {
                     try {
                         const finalRound = Sched.nextWakeAt(Date.now()) === 0;
                         const untilMin = (() => {
-                            const h = Sched.planRange(Date.now());
+                            const h = Sched.planRaw();
                             return h ? Number(h.untilMin) : NaN;
                         })();
                         const remainMin = Number.isFinite(untilMin)
@@ -10236,14 +10684,14 @@ const __scBgKeepAlive = (function() {
         } else {
             text += `上一轮：还没有记录\n`;
         }
-        text += `单轮搜索上限：20 分钟（到点交班，剩余配额留到下一次定时唤醒）\n`;
+        text += `搜索节点上限：20 分钟（节点到点就换下一个搜索节点继续，剩余配额不会丢）\n`;
         {
-            const spreadOn = GM_getValue("Config.spread", true) !== false;
             const left = Sched.roundsLeftToday();
-            text += `分散到全天：${spreadOn ? `开启（今天还剩 ${left} 个随机执行点；`
-                + `每轮次数 = 「还差 ÷ 剩余轮数」再乘随机系数，可能整轮跳过，做完即停）` : "关闭（每轮满功率搜到配额满或到 20 分钟）"}\n`;
+            text += `分配方式：节点模式（不再按剩余轮数 ${left} 分摊、不会整轮跳过；搜索节点就是把 20 分钟全用来搜）\n`;
         }
-        text += `整轮墙钟预算：20 分钟（到点不再开新阶段，剩余任务交给下一轮）\n`;
+        text += `一轮结构：搜索 → 阅读 → 其他活动（每类一个节点，互不混），节点之间 1~3 分钟随机，一轮总上限 60 分钟\n`;
+        text += `执行点间隔：约 70 分钟（一轮 60 分钟 + 收尾余量）。命中一个点就连着做下去，`
+            + `循环期间撞到的后续执行点会直接让路（不浪费，只是合并进这一轮）\n`;
         text += `限流计数：${guard.streak}/${SEARCH_GUARD.STREAK_LIMIT}`
             + (coolLeft > 0 ? `（冷却中，约 ${Math.ceil(coolLeft / 60000)} 分钟后自动重试）` : "") + "\n";
         text += `任务标记：${TaskManager.searchDate === RewardsAuto.state.dateNowNum ? "今日已完成" : "今日未完成"}\n\n`;
@@ -10507,7 +10955,13 @@ const __scBgKeepAlive = (function() {
     };
 
     /* ══ 定时（cron）模式：每分钟敲门 + 每日随机排程 ══
-       @crontab 设为每分钟「敲门」一次（9-18 点），但敲门 ≠ 开跑。
+       @crontab 设为每分钟「敲门」一次（9-23 点 = 9:00~23:59 每分钟），但敲门 ≠ 开跑。
+       为什么恰好是 9-23：zy.py 的 RUN_WINDOW 默认 09:00-15:00（开机最早 9 点），
+       收工又硬顶在 23:59，所以 9~23 这一段已经完整覆盖计划能落到的范围。
+       ⚠ 不要把这里再放宽成 `* * * * *`：凌晨的唤醒一个都跑不到任务，只会让脚本猫
+       引擎的空转退避（本环境实测会退避到 20 分钟一次）积累得更狠，反过来拖累白天
+       的准点敲门。反过来，如果把 zy.py 的 RUN_WINDOW 改到 9 点之前，这里要跟着放
+       （例如 07:00-15:00 → `* 7-23 * * *`），否则开机后前两个小时脚本不会醒。
        真正开跑由当天的随机排程决定：在区间内撒若干个「精确到分钟」的执行点
        （如 14:21 / 16:22），哪一分钟是执行点，那一分钟就叫醒并立即开跑，
        不需要「等下一个 10 分钟刻度」，也不需要先认领再干等。
@@ -10516,7 +10970,8 @@ const __scBgKeepAlive = (function() {
        代价是脚本猫每天多出约 500 次「空敲门」（静默退出，不跑任务、不打日志）。
        排程种子 = 日期 + 本账号的随机盐，四账号区间一致、执行点各不相同
        （不会四个账号同一分钟一起打接口）。
-       运行时段仍由 Config.winTime 再兜一层。浏览器关闭时不会触发。 */
+       运行时段以 zy.py 计划为准（读不到才用 Config.winTime 兜底，默认 09:00~23:00）。
+       浏览器关闭时不会触发。 */
     const CRON_WAKE_MS = 60 * 1000;           // 敲门周期（与 @crontab 每分钟对齐）
     const CRON_PERIOD = 60 * 1000;
     /* 命中窗口：@crontab 每分钟叫醒一次，所以执行点是哪一分钟，那一分钟就会开跑，
@@ -10550,8 +11005,8 @@ const __scBgKeepAlive = (function() {
        老注释说「crontab 被退避成 20 分钟、只有整 10 分钟准点」——那是早期环境的观测；
        2026-11-21 17:23 那份日志证明新环境每分钟都准点敲门（17:31/17:32/17:33…
        每分钟都有 exec script complete），引擎已能真正做到每分钟唤醒。
-       故改为 1：执行点精确到任意分钟（17:31、18:07…），配合 MIN_GAP=15 的撒点算法，
-       间隔变成各种非规整值（15 分钟是下限，区间够长时随机分桶会把间隔拉开），
+       故改为 1：执行点精确到任意分钟（17:31、18:07…），配合 MIN_GAP 的撒点算法，
+       间隔变成各种非规整值（下限 MIN_GAP，区间够长时随机分桶会把间隔拉开），
        四账号各用各的盐 → 排程天然不同。
        命中逻辑按分钟判定（hitWakePoint 的 curMin），与网格无关，改这里不影响命中。 */
     const SCHED_GRID = 1;
@@ -10569,10 +11024,23 @@ const __scBgKeepAlive = (function() {
            冻结本身改不了，改为摊薄风险：轮数翻倍 → 每轮分到的搜索/阅读次数减半 →
            单轮里的长等待更短 → 撞上冻结窗口的概率降低；即便某轮被打断，
            丢的也只是这一轮的一两次，后面还有十几轮能补回来。
-           pickShare 按剩余轮数摊派，轮数一多每轮份额自动变少，无需改分配代码。 */
-        MIN_POINTS: 10,
-        MAX_POINTS: 20,
-        MIN_GAP: 15,     // 相邻执行点最小间隔（分钟）：下限 15；区间够长时随机分桶会把间隔拉开到更大
+           pickShare 按剩余轮数摊派，轮数一多每轮份额自动变少，无需改分配代码。
+           ⚠ v0.79 起 spread 已关（节点内满功率跑），这段「摊薄」逻辑只剩历史意义。 */
+
+        /* ══ 2026-11-22（v0.79）：撒点改成跟着「一轮」走 ══
+           节点式执行后，一轮不再是 20 分钟，而是最长 60 分钟：
+             3 个 20 分钟节点 + 2 次 1~3 分钟节点间隔 + 1~3 分钟收尾汇总
+           旧参数（间隔 15 分钟、点 10~20 个）是「一点跑一轮 20 分钟」时代的产物。
+           按旧参数撒点，命中一个点后接下来 3~4 个点都会在节点循环里被让路
+           （日志刷「上一轮还在执行中…本分钟静默让路」），看起来像「排了 15 个点只跑 4 轮」，
+           实际覆盖时长没变，但排程信息全是噪音，也失去了「点到就开工」的意义。
+           现在：间隔 ≈ 一轮长度 + 收尾余量（70 分钟），点数由区间长度和间隔自动算
+           （9:00~18:00 约 7~8 个，13:00 才开机约 4~5 个），点与点基本首尾相接。
+           想做更多就调节点间隔（Config.nodeGapMin/Max），加执行点没用。 */
+        MIN_POINTS: 3,
+        MAX_POINTS: 9,
+        MIN_GAP: 70,     // 相邻执行点最小间隔（分钟）= 一轮 60 分钟 + 收尾余量
+
         /* 区间末尾留的余量：EDGE_PAD 防贴边，ROUND_TAIL 给最后一个执行点留出
            一整个 20 分钟的搜索预算。以前只留 10 分钟，末点落在 17:50，
            18:00 一关浏览器，最后一轮没做完的搜索就直接跨天丢了。 */
@@ -10580,7 +11048,7 @@ const __scBgKeepAlive = (function() {
         ROUND_TAIL: 20
         /* SCHED_GRID=1（见上）：执行点精确到分钟（14:21 就是 14:21），
            靠「每分钟敲门、到点即跑」对齐 @crontab 的节拍；间隔长短由
-           MIN_GAP + 随机分桶决定，落在 15 分钟以上的连续随机值，不再是固定刻度。 */
+           MIN_GAP + 随机分桶决定，落在 70 分钟以上的连续随机值，不再是固定刻度。 */
     };
 
     /* ══ 与 zy.py 的计划联动（第二层随机）══
@@ -10613,10 +11081,26 @@ const __scBgKeepAlive = (function() {
     /* 计划的有效期：只认「今天」的计划，昨天的文件一律忽略
        （每天开机时刻都不同，沿用旧值会把执行点撒到已经过去的时刻上） */
     const PLAN_MAX_AGE_MS = 20 * 60 * 60 * 1000;
+    /* 计划执行点的上界：18:00。用户要求（2026-11-22）——计划不排 18 点后；
+       过了 18 点就直接按默认一轮接一轮做，做到今天做完为止（见 todayPlan 的 continuous 分支）。 */
+    const PLAN_CUTOFF_MIN = 18 * 60;
+    /* 18 点后的节拍：两轮之间至少空这么久（从上一轮结束算）。
+       用户要求（2026-11-22，对照本地 yh.js）：yh.js 的 @crontab 是每 20 分钟一次，
+       天然每 20 分钟一轮、一轮 1~2 分钟；本脚本是每分钟敲门，18 点后又「每次敲门都放行」，
+       结果变成每 2 分钟一轮、轮轮把签入/面板/桌面/月度/连签/每日活动/国际版/领奖/二次扫描/Edge
+       全重打一遍 —— 22:06~22:14 那份日志里四个账号各刷了 4~5 轮，全是空转。
+       现在按 20 分钟节拍走：上一轮结束满 20 分钟才允许下一轮。 */
+    const AFTER18_IDLE_MS = 20 * 60 * 1000;
+    /* 上一轮结束时刻（落盘）。18 点后的节拍、诊断面板都读它。 */
+    const ROUND_END_KEY = "Config.lastRoundEndAt";
     /* 拉计划失败后的重试间隔。浏览器刚起来的那一次敲门，8080 可能刚好没响应、
        或计划文件正在写 —— 不能因为这一次失败就一整天回退到唤醒分布。
        敲门周期本身就是 10 分钟，所以这里取 3 分钟不会造成额外请求压力。 */
     const PLAN_RETRY_MS = 3 * 60 * 1000;
+    /* 上一次「尝试拉计划」的时刻：必须落盘。放内存变量等于没有 —— 脚本猫的后台执行
+       上下文每次敲门都是新建的（日志里每次都是先 exec script complete 再来一轮），
+       内存状态一律清零，节流也就永远不生效。 */
+    const PLAN_TRY_KEY = "Config.planTryAt";
     /* 「迟到补救」记录：浏览器比区间起点晚很久才起来时，把起点抬到当时并落盘。
        必须落盘而不是每次按 now 重算 —— 否则每次敲门算出的区间都不同（rangeKey 变），
        当天已跑过的执行点进度会被反复重置。 */
@@ -10694,7 +11178,8 @@ const __scBgKeepAlive = (function() {
     const ROUND_HARD_LIMIT = ROUND_BUDGET_MS + 20 * 60 * 1000;
 
     /* ══ 每日运行窗口 ══
-       默认 09:00~23:00（Config.winTime），窗口外只保留定时唤醒，不开新的一轮。
+       默认 auto：直接采用 zy.py 计划里的「开机 ~ 收工」，窗口外只保留定时唤醒、
+       不开新的一轮；计划读不到时退回出厂 09:00~23:00（脚本单独跑也不会半夜乱开）。
        开始时刻不做随机推后（同一天恒等，计划才不漂移）。 */
     const WINDOW = {
         TIME_DEFAULT: "09:00-23:00",
@@ -10783,17 +11268,53 @@ const __scBgKeepAlive = (function() {
             };
         },
 
+        /* zy.py 计划里的「开机 ~ 收工」区间（分钟），只认今天的计划。
+           用 planRaw（不卡「区间够不够撒点」）：短计划（23:27~23:59）也要能当运行时段。 */
+        planWin() {
+            const r = this.planRaw();
+            return r ? { startMin: r.startMin, endMin: r.untilMin } : null;
+        },
+
         winCfg() {
-            /* 优先用 Config.winTime；没填或解析不了时，
-               依次回退到旧版的小时配置、最后回退出厂默认。 */
-            let parsed = this.parseWinTime(GM_getValue("Config.winTime", null));
+            /* 运行时段只有一条规则：**有今天的计划就照计划，没有才用配置兜底**。
+               zy.py 管着浏览器生命周期（几点拉起、任务全做完才关进程），脚本再按
+               出厂 09:00-23:00 自己关一次门就是第二道闸门。线上 23:12 那次就是这么
+               白跑的：zy.py 把收工顺延到 23:59、浏览器开着，脚本却判定「不在
+               09:00~23:00」，一个任务没做、空转到 23:59 被关进程。
+               优先级（从高到低）：
+                 ① 配置里显式写成全天（开始=结束，或 00:00-24:00）→ 全天不限。
+                    这是「不管计划、现在就放开跑」的逃生口，专供手动排查；
+                 ② 今天的计划在（date 对得上）→ 时段 = 计划的开机 ~ 收工，精确跟随，
+                    配置项**不参与**（所以面板里那一项可以整项留空）；
+                 ③ 计划读不到（没有 zy.py / 文件过期 / 不是今天）→ 用配置兜底，
+                    留空按 09:00-23:00，保证脚本脱离 zy.py 单独跑也不会半夜乱开。 */
+            const raw = GM_getValue("Config.winTime", null);
+            const rs = String(raw == null ? "" : raw).trim().toLowerCase();
+            const autoMode = rs === "" || rs === "auto" || rs === "plan" || rs === "跟随计划";
+            let parsed = this.parseWinTime(raw);
             if (!parsed) parsed = this.legacyWin();
+            const rawFull = !!parsed && ((parsed.endMin - parsed.startMin + 1440) % 1440 === 0);
+            if (rawFull) {
+                return { startMin: parsed.startMin, endMin: parsed.endMin,
+                         allDay: true, planUsed: false, auto: autoMode };
+            }
+            const pw = this.planWin();
+            if (pw && pw.endMin !== pw.startMin) {
+                return { startMin: pw.startMin, endMin: pw.endMin,
+                         allDay: false, planUsed: true, auto: true };
+            }
             if (!parsed) parsed = this.parseWinTime(WINDOW.TIME_DEFAULT);
             if (!parsed) parsed = { startMin: 9 * 60, endMin: 23 * 60 };
-            const { startMin, endMin } = parsed;
-            /* 前后相同 = 全天不限；00:00-24:00 也是整整一天，同按不限处理 */
-            const full = (endMin - startMin + 1440) % 1440 === 0;
-            return { startMin, endMin, allDay: startMin === endMin || full };
+            return { startMin: parsed.startMin, endMin: parsed.endMin,
+                     allDay: false, planUsed: false, auto: autoMode };
+        },
+
+        /* 时段的人话描述（日志/诊断面板统一用它，避免五处各拼一遍） */
+        winSpan() {
+            const c = this.winCfg();
+            if (c.allDay) return "全天不限";
+            const base = `${this.fmtHM(c.startMin)}~${this.fmtHM(c.endMin)}`;
+            return c.planUsed ? `${base}（zy.py 计划）` : `${base}（兜底：未读到 zy.py 计划）`;
         },
 
         /* 某个「日历日」的运行窗口 [start, end)，精确到分钟。
@@ -10843,8 +11364,9 @@ const __scBgKeepAlive = (function() {
            存储结构：{ v, date, mode, name, points:[分钟...], used:[bool...] } */
         PLAN_KEY() { return "Config.randomPlan"; },
         /* v8：执行点不再吸附 10 分钟网格，改为「精确到分钟 + 提前认领等整分钟」；
-           v10：轮数加密（点数 5~10 → 10~20、MIN_GAP 30 → 15），旧排程必须重建 */
-        PLAN_VER: 10,
+           v10：轮数加密（点数 5~10 → 10~20、MIN_GAP 30 → 15），旧排程必须重建
+           v11：节点式执行配套（点数 3~9、MIN_GAP 15 → 70），旧排程必须重建 */
+        PLAN_VER: 11,
 
         /* ── zy.py 计划文件 ──────────────────────────────────────────
            计划内容（zy.py 写出）：
@@ -10905,8 +11427,30 @@ const __scBgKeepAlive = (function() {
                 untilMin: Number(c.untilMin),
                 startAt: String(c.startAt || ""),
                 runUntil: String(c.runUntil || ""),
+                crossDay: !!c.crossDay,
                 boot: Number(c.boot) || 0
             };
+        },
+
+        /* 原始计划缓存：只校验「是不是今天的」，**不校验区间宽度**。
+           为什么需要它：planRange() 有一条 `hi - lo < MIN_GAP(70 分钟)` 的校验
+           （那是给「撒执行点」用的，区间太窄确实撒不出点）。但像 zy.py 23:27 启动、
+           收工 23:59 这种只有 32 分钟的计划，收工时刻**照样有效** ——
+           只想要 untilMin 的地方（节点循环夹紧、收官补跑判断、运行时段 auto）
+           不能因为「不够撒点」就把收工线也丢了，否则 23:30 开一轮 60 分钟
+           会被 zy.py 23:59 关浏览器腰斩。 */
+        planRaw() {
+            try {
+                const c = GM_getValue(PLAN_CACHE_KEY, null);
+                if (!c || typeof c !== "object") return null;
+                if (Number(c.date) !== Utils.getTodayNum()) return null;
+                const startMin = Number(c.startMin), untilMin = Number(c.untilMin);
+                if (!Number.isFinite(startMin) || !Number.isFinite(untilMin)) return null;
+                if (startMin < 0 || untilMin <= 0) return null;
+                return { startMin, untilMin, crossDay: !!c.crossDay };
+            } catch (_) {
+                return null;
+            }
         },
 
         /* 拉一次计划文件并落缓存。execPlan 关掉时不拉。
@@ -10972,35 +11516,84 @@ const __scBgKeepAlive = (function() {
                 this._planErr = `计划太旧（写入于 ${new Date(ts).toLocaleString()}）`;
                 return null;
             }
+            /* 计划比本次浏览器启动还早 5 分钟以上 → 上一次会话留下的 leftovers。
+               zy.py 正常是「先写计划、几秒后起浏览器」，差值只有几秒，不会被误杀；
+               但 47831 若被上一轮的旧实例占着（新进程 bind 失败换到 47832），
+               或浏览器重启后没及时重写计划，这里就会读到上一轮的旧开机时刻
+               （线上 20:59 那次的 20:09 就是这种形态）。 */
+            const origin = Number((typeof performance !== "undefined" && performance.timeOrigin) || 0);
+            if (ts > 0 && origin > 0 && ts < origin - 5 * 60 * 1000) {
+                this._planErr = `计划写入于 ${new Date(ts).toLocaleTimeString()}，`
+                    + `早于本次浏览器启动 ${new Date(origin).toLocaleTimeString()} → 上一次会话的旧计划`;
+                return null;
+            }
 
             const startMin = this.parsePlanMin(data.startAt);
-            const untilMin = this.parsePlanMin(data.runUntil);
+            let untilMin = this.parsePlanMin(data.runUntil);
+            const untilDay = this.planDateNum(data.runUntil);   // 收工日期（可能是次日）
             if (startMin < 0 || untilMin < 0) {
                 this._planErr = `计划字段解析失败（startAt=${data.startAt} runUntil=${data.runUntil}）`;
                 return null;
             }
+            /* 收工跨天：zy.py「启动偏晚 → 收工顺延一整轮」时，收工常落在次日 00:00
+               （线上 20:58 那次就是「收工顺延到 00:00」）。"00:00" 解析成 0 分钟，
+               比开机 20:58（1258）还小 → 区间反转 → 旧逻辑判「计划区间太窄
+               （20:58~00:00，已过收工？）」把整份计划丢掉，只能沿用上一次会话的
+               旧计划（开机 20:09）。后果不只是区间错：读不到计划 = 读不到 hold 标记，
+               脚本 21:00:10 照常开跑，zy.py 21:00:22 才开始校准 —— 校准掐断正在跑的
+               那一轮的老问题又回来了。
+               本脚本只在这一天内撒点，所以「次日收工」一律按今天 23:59 收工处理。 */
+            let crossDay = false;
+            if (untilMin <= startMin) {
+                crossDay = true;
+                untilMin = 24 * 60 - 1;
+            }
 
             /* 首点 = 开机后 PLAN_HEAD_PAD 分钟；末点 = 收工前 EDGE_PAD + 一轮搜索预算，
-               保证最后一个执行点整轮跑完时还没到收工时刻 */
+               保证最后一个执行点整轮跑完时还没到收工时刻。18:00 是硬上界：计划不排 18 点后。 */
             let lo = startMin + PLAN_HEAD_PAD;
-            let hi = untilMin - RANDOM_WAKE.EDGE_PAD - RANDOM_WAKE.ROUND_TAIL;
-            /* 浏览器起得晚 / 收工早：区间不够就退让到「还能塞几个点」的最小可用范围 */
+            let hi = Math.min(untilMin - RANDOM_WAKE.EDGE_PAD - RANDOM_WAKE.ROUND_TAIL,
+                              PLAN_CUTOFF_MIN);
+            /* 浏览器起得晚 / 收工早：区间不够就退让到「还能塞几个点」的最小可用范围。
+               ⚠ 退让后的上界仍要卡在 18:00 —— 否则 17:50 这种「只剩个尾巴」的开机，
+               退让会把 hi 顶回收工时刻（23:59），又把执行点排到 18 点以后。 */
             if (hi - lo < RANDOM_WAKE.MIN_GAP) {
                 lo = Math.min(startMin, untilMin);
-                hi = untilMin;
+                hi = Math.min(untilMin, PLAN_CUTOFF_MIN);
             }
+            /* 18 点后才开机（或此刻已过 18 点）：计划不再撒执行点（18 点后由
+               todayPlan 走 continuous，每分钟都可能开跑），但「开机 ~ 收工」这两根线
+               必须落盘。以前这里直接 return null 把整份计划丢掉，后果有三个：
+                 · winTime=auto 拿不到 startMin/untilMin → 退回 09:00~23:00（或旧计划的
+                   09:00~15:00）当时段 → 晚上一律判「不在运行时段」→ 整晚空转；
+                 · 节点循环拿不到 untilMin → 23:30 开一轮 60 分钟被 23:59 关浏览器腰斩；
+                 · 连 zy.py 的「暂缓开跑」hold 都读不到 → 校准期间照样开跑。
+               （线上 23:27 启动、23:30 还只有每分钟一条 exec script complete，就是这个。） */
+            const nowMinNow = (() => {
+                const d = new Date();
+                return d.getHours() * 60 + d.getMinutes();
+            })();
+            const after18Start = startMin >= PLAN_CUTOFF_MIN || nowMinNow >= PLAN_CUTOFF_MIN;
+            let noPoints = false;
             if (hi - lo < 1) {
-                this._planErr = `计划区间太窄（${this.fmtHM(startMin)}~${this.fmtHM(untilMin)}，已过收工？）`;
-                return null;
+                if (!after18Start) {
+                    this._planErr = `18:00 前已没有可用区间（开机 ${this.fmtHM(startMin)}，`
+                        + `收工 ${this.fmtHM(untilMin)}）；计划不排 18 点后`;
+                    return null;
+                }
+                noPoints = true;
+                lo = startMin;
+                hi = Math.max(startMin, untilMin);
             }
 
-            const name = "计划";
+            const name = noPoints ? "计划（18 点后连续）" : "计划";
             const rec = {
                 date: Utils.getTodayNum(),
                 lo, hi, name,
                 startMin, untilMin,
                 startAt: String(data.startAt || ""),
                 runUntil: String(data.runUntil || ""),
+                crossDay,
                 /* 记下是哪次浏览器会话读到的：换会话（浏览器重启）后要重新读，
                    因为 zy.py 重启会重新决定开机时刻，旧的区间已经作废。 */
                 boot: this.bootId(),
@@ -11016,7 +11609,10 @@ const __scBgKeepAlive = (function() {
                 GM_setValue("Config.planHoldUntil", (data.hold && holdUntil > Date.now()) ? holdUntil : 0);
             } catch (_) {}
             GM_setValue(PLAN_CACHE_KEY, rec);
-            return this.planRange();
+            /* 直接返回 rec，不走 planRange()：planRange 有一条「区间至少 70 分钟」的
+               校验（那是给撒点用的），18 点后启动的短计划（23:27~23:59）会被它过滤成
+               null，调用方就会以为「没读到计划」。rec 本身字段齐全，够调用方用。 */
+            return rec;
         },
 
         /* runOnce 里调用。拿到一次就锁定（本会话后续不再重复拉）；
@@ -11027,25 +11623,71 @@ const __scBgKeepAlive = (function() {
                 this._planOff = true;
                 return null;
             }
-            /* 同一次浏览器会话里已经读到过今天的计划 → 直接复用，不再依赖 8080 是否还活着 */
+            /* 18 点后不排点，但仍要读一次计划拿 untilMin（收工时刻）：
+               zy.py 顺延到 23:59 时，节点循环必须知道几点必须收手，否则 23:30 开一轮
+               60 分钟会被关浏览器腰斩。原来这里直接 return，18 点后开机根本读不到收工时刻。
+               读不到也不影响开跑（todayPlan 走连续模式）。 */
+            const d18 = new Date();
+            const nowMin18 = d18.getHours() * 60 + d18.getMinutes();
+            if (nowMin18 >= PLAN_CUTOFF_MIN) {
+                /* ★ 判断「缓存还新不新」不能只看有没有：早上那次会话读到的计划
+                   （如 09:12~15:00）到今天 18 点后依然算「今天的」，可它的收工时刻早过去了。
+                   winTime=auto 直接拿这个区间当时段，就会算出 09:00~15:00 →
+                   晚上一律判「不在运行时段」→ 整晚空转（线上 23:30 那次：0.82 已经装好，
+                   日志里却还是每分钟一条 exec script complete，一条任务都没有）。
+                   所以按「收工时刻是否已过」判新鲜度：过了就必须重拉一次。 */
+                const raw = this.planRaw();
+                const stale = !raw || Number(raw.untilMin) <= nowMin18;
+                if (stale) {
+                    const triedAt = Number(GM_getValue(PLAN_TRY_KEY, 0)) || 0;
+                    if (!(Date.now() - triedAt < PLAN_RETRY_MS)) {
+                        try { GM_setValue(PLAN_TRY_KEY, Date.now()); } catch (_) {}
+                        try { await this.fetchRunPlan(); } catch (_) {}
+                    }
+                }
+                return this.todayPlan();
+            }
+            /* 同一次浏览器启动内读到过今天的计划 → 直接复用，不再依赖 47831 是否还活着。
+               跨上下文（bootId 不同）时**不能**无条件重拉 —— bootId 是
+               performance.timeOrigin，脚本猫每次敲门都新建后台执行上下文，这个值每次
+               都会变（线上 20:59:06 与 21:00:00 连刷两条「读不到」就是这么来的：缓存明明
+               在，却因为 boot 不等又去拉一遍）。改成每 PLAN_RETRY_MS 允许复核一次开机
+               时刻（zy.py 真重启过才需要换区间），复核记录落盘，跨上下文才有效。 */
             const cached = this.planRange();
             const boot = this.bootId();
-            if (cached && (boot === 0 || cached.boot === boot)) return cached;
-
             const now = Date.now();
-            if (this._planTryAt && now - this._planTryAt < PLAN_RETRY_MS) return cached;
+            if (cached) {
+                if (boot === 0 || cached.boot === boot) return cached;
+                const triedAt = Number(GM_getValue(PLAN_TRY_KEY, 0)) || 0;
+                if (now - triedAt < PLAN_RETRY_MS) return cached;
+                try { GM_setValue(PLAN_TRY_KEY, now); } catch (_) {}
+            } else if (this._planTryAt && now - this._planTryAt < PLAN_RETRY_MS) {
+                return null;
+            }
             this._planTryAt = now;
 
             const got = await this.fetchRunPlan();
             if (got) {
                 Utils.log("📋", `已读取 zy.py 计划（${this._planUrl || PLAN_DEFAULT_URL}）：`
-                    + `开机 ${this.fmtHM(got.startMin)} → 收工 ${this.fmtHM(got.untilMin)}，`
-                    + `执行点撒在 ${this.fmtHM(got.lo)}~${this.fmtHM(got.hi)}（本账号内随机）`);
+                    + `开机 ${this.fmtHM(got.startMin)} → 收工 ${this.fmtHM(got.untilMin)}`
+                    + (got.crossDay ? "（收工在次日，按今日 23:59 收工）" : "")
+                    + `，执行点撒在 ${this.fmtHM(got.lo)}~${this.fmtHM(got.hi)}（本账号内随机）`);
                 return got;
             }
-            /* 拉不到就退回上一次读到的计划（比完全无计划更接近真实开机时刻） */
+            /* 拉不到就退回上一次读到的计划（比完全无计划更接近真实开机时刻）。
+               必须把失败原因一起打出来：只说「读不到」时根本无从判断是端口没起、
+               超时、还是内容不对（20:58 那次就是「收工跨天」被判成「区间太窄」，
+               日志里完全看不出来）。这里 10 分钟节流，避免每次敲门刷一条。 */
             if (cached) {
-                Utils.log("📋", `本次读不到 zy.py 计划文件，沿用本会话缓存的开机时刻 ${this.fmtHM(cached.startMin)}`);
+                const lastStale = Number(GM_getValue("Config.planStaleLogAt", 0)) || 0;
+                if (now - lastStale >= 10 * 60 * 1000) {
+                    try { GM_setValue("Config.planStaleLogAt", now); } catch (_) {}
+                    Utils.log("📋", `本次读不到 zy.py 计划（${this._planErr || "原因未知"}），`
+                        + `沿用上次读到的计划：开机 ${this.fmtHM(cached.startMin)} → `
+                        + `收工 ${this.fmtHM(cached.untilMin)}`
+                        + (cached.crossDay ? "（次日）" : "")
+                        + `；${Math.round(PLAN_RETRY_MS / 60000)} 分钟后自动重试`);
+                }
                 return cached;
             }
             /* 完全没有计划：说清楚「今天用的是回退分布」，否则日志里只看到「下午」看不出原因。
@@ -11063,14 +11705,59 @@ const __scBgKeepAlive = (function() {
             return null;
         },
 
+        /* 只读计划里的「暂缓开跑」标记（hold / holdUntil），不看区间、不写排程缓存。
+           为什么单独抽出来：18 点后 todayPlan 直接返回 continuous，fetchRunPlan 的
+           区间会被 clamp 掉，于是 hold 压根读不到 —— 18 点后 hold 等于不存在。
+           后果是 zy.py 装扩展/校准脚本时没有任何保护：
+             18:40 拉起的浏览器，18:41 脚本就开跑了（日志实测），
+             zy.py 只能等「轮次空窗」——连续模式下一轮接一轮，等不到，
+             于是要么 90 秒后硬升把正在跑的那一轮掐断，要么干脆永远不升。
+           这里只取两个字段，跟排程逻辑完全解耦，18 点后照样能读。 */
+        async fetchPlanHold() {
+            let custom = String(GM_getValue("Config.planUrl", "") || "").trim();
+            if (custom && /:(1808[0-9]|808[0-9])\//.test(custom)) custom = "";
+            const urls = custom ? [custom] : PLAN_DEFAULT_URLS;
+            for (const url of urls) {
+                let raw = "";
+                try {
+                    const res = await Utils.xhrFull({ url, timeout: 5000, cookie: false });
+                    raw = String((res && res.text) || "");
+                } catch (_) { continue; }
+                let data = null;
+                try { data = JSON.parse(raw); } catch (_) { continue; }
+                if (!data || typeof data !== "object") continue;
+                let holdUntil = Number(data.holdUntil) || 0;
+                if (holdUntil > 0 && holdUntil < 1e12) holdUntil *= 1000;   // 兼容秒级写法
+                try {
+                    GM_setValue("Config.planHoldUntil",
+                        (data.hold && holdUntil > Date.now()) ? holdUntil : 0);
+                } catch (_) {}
+                return true;
+            }
+            /* 全都读不到就保持原值（不清零）：zy.py 只是短暂重启时，
+               旧的 holdUntil 会自己到期失效，不需要这里主动抹掉。 */
+            return false;
+        },
+
         /* 主动重读一次计划里的 hold 标记（绕过 planRange 缓存）。
            hold 只在「确实要开跑」时才查，所以这点额外请求可以忽略；
-           15 秒节流，避免同一分钟内重复拉。 */
+           30 秒节流，避免同一分钟内重复拉。 */
         async refreshPlanHold() {
             const now = Date.now();
-            if (this._holdTryAt && now - this._holdTryAt < 15000) return;
+            /* 节流必须落盘：放内存里时每次上下文重建都失效，
+               一个执行点可能连拉好几次；30 秒足够覆盖「同一分钟内多次敲门」。 */
+            const last = Number(GM_getValue("Config.holdTryAt", 0)) || 0;
+            if (last && now - last < 30000) return;
+            /* 读不到就退避 5 分钟：18 点后每分钟都会走到这里，zy.py 一挂，
+               三个端口 × 5 秒超时 = 每次敲门白等 15 秒，比不做还糟。
+               退避期间只信已有的 planHoldUntil（它会自己到期失效）。 */
+            const failAt = Number(GM_getValue("Config.holdFailAt", 0)) || 0;
+            if (failAt && now - failAt < 5 * 60 * 1000) return;
+            try { GM_setValue("Config.holdTryAt", now); } catch (_) {}
             this._holdTryAt = now;
-            try { await this.fetchRunPlan(); } catch (_) {}
+            let ok = false;
+            try { ok = await this.fetchPlanHold(); } catch (_) { ok = false; }
+            try { GM_setValue("Config.holdFailAt", ok ? 0 : now); } catch (_) {}
         },
 
         planHoldLeft() {
@@ -11082,13 +11769,39 @@ const __scBgKeepAlive = (function() {
             const date = Utils.getTodayNum();
             const key = this.PLAN_KEY();
 
+            /* ══ 18:00 之后：不再用计划排点，直接连续做 ══
+               用户要求（2026-11-22）：任务只要到了 18 点后，就按默认一直做，做到今天做完
+               为止；计划不排 18 点后。
+               这里直接返回一个空排程（不撒点、不写缓存、不打「今日排程」日志 ——
+               18 点后每分钟敲一次门，再打日志就是刷屏）。真正的开跑由 hitWakePoint 的
+               「18 点后连续」分支放行；上一轮还在跑时由 ⑦ 让路，不会并行。 */
+            const d18 = new Date(now);
+            if (d18.getHours() * 60 + d18.getMinutes() >= PLAN_CUTOFF_MIN) {
+                return {
+                    v: this.PLAN_VER, date, mode: "continuous", name: "18 点后连续",
+                    points: [], used: [], rangeKey: `continuous|${date}`
+                };
+            }
+
             /* 排程本体：日期 + 本账号的盐作种子的确定性伪随机。
                同一账号当天结果稳定（敲门重算不会换点），不同账号则互不相同。 */
             const rnd = seededRnd((date ^ this.salt()) >>> 0);
 
             /* ① 优先用 zy.py 的计划：开机时刻 ~ 收工时刻 之间撒点（第二层随机）。
                   拿不到时才退回「唤醒分布」（上午/下午/全天 的固定区间）。 */
-            const plan = (!this._planOff) ? this.planRange(now) : null;
+            let plan = (!this._planOff) ? this.planRange(now) : null;
+            /* 计划不排 18 点后（用户要求 2026-11-22）：18:00 之后不再等执行点，
+               脚本改成「一轮接一轮一直做，做到今天做完为止」。所以先把计划区间上界
+               压到 18:00；压完不够一个最小间隔（开机本身就在 18 点后，或只剩个尾巴），
+               就当没有计划 —— 反正 18 点后不看点。 */
+            if (plan) {
+                const hiPlan = Math.min(plan.hi, PLAN_CUTOFF_MIN);
+                if (hiPlan - plan.lo < RANDOM_WAKE.MIN_GAP) {
+                    plan = null;
+                } else {
+                    plan = Object.assign({}, plan, { hi: hiPlan });
+                }
+            }
             let mode, name, lo, hi;
             if (plan) {
                 mode = "plan";
@@ -11159,9 +11872,11 @@ const __scBgKeepAlive = (function() {
             }
             if (lateStart > lo) lo = lateStart;
             /* 回退且启动已晚于原模式收工线（如 13:10 才起、却分到上午 hi=12:30）：
-               把收工线顺延，保证区间不反转、仍有一段可铺。上限 23:00（与 crontab/winTime 对齐）。 */
+               把收工线顺延，保证区间不反转、仍有一段可铺。上限 18:00 —— 18 点之后
+               不再排执行点（todayPlan 开头已整段接管成「连续跑」）。 */
             if (!plan && lo >= hi) {
-                hi = Math.min(23 * 60, lo + RANDOM_WAKE.MIN_POINTS * RANDOM_WAKE.MIN_GAP + RANDOM_WAKE.ROUND_TAIL);
+                hi = Math.max(lo, Math.min(PLAN_CUTOFF_MIN,
+                    lo + RANDOM_WAKE.MIN_POINTS * RANDOM_WAKE.MIN_GAP + RANDOM_WAKE.ROUND_TAIL));
             }
 
             /* ③ 撒点：对齐引擎真正可信的唤醒节拍（SCHED_GRID 分钟）。
@@ -11179,6 +11894,8 @@ const __scBgKeepAlive = (function() {
                   同时首尾都有留白、间隔长短不一 —— 四账号各用各的盐，排程天然不同。 */
             const GAP = RANDOM_WAKE.MIN_GAP;      /* 相邻点最小间隔（分钟），须为网格整数倍 */
             const GRID = SCHED_GRID;
+
+            let points;
             const slots = [];
             for (let m = Math.ceil(lo / GRID) * GRID; m <= Math.floor(hi / GRID) * GRID; m += GRID) slots.push(m);
             if (!slots.length) slots.push(Math.round(lo / GRID) * GRID);   /* 区间窄到塞不进一格 */
@@ -11190,7 +11907,6 @@ const __scBgKeepAlive = (function() {
             /* 余量太少时降点数：余量 0 意味着所有点被钉死，四账号会排出同一套排程 */
             const keepN = Math.min(RANDOM_WAKE.MIN_POINTS, nMax);
             while (n > keepN && (spanIdx - step * (n - 1)) < 4) n--;
-            let points;
             if (n <= 1) {
                 points = [slots[Math.floor(rnd() * L)]];
             } else {
@@ -11231,7 +11947,7 @@ const __scBgKeepAlive = (function() {
                 const lateNote = lateStart > 0
                     ? `；${this.fmtHM(lateStart - 1)} 才起来，已把之后的时间重新铺满` : "";
                 const label = plan
-                    ? `计划 ${this.fmtHM(lo)}~${this.fmtHM(hi)}（zy.py 开机 ${this.fmtHM(plan.startMin)}、收工 ${this.fmtHM(plan.untilMin)}${lateNote}）`
+                    ? `计划 ${this.fmtHM(lo)}~${this.fmtHM(hi)}（zy.py 开机 ${this.fmtHM(plan.startMin)}、收工 ${this.fmtHM(plan.untilMin)}${plan.crossDay ? "（次日）" : ""}${lateNote}）`
                     : `${this.fmtHM(lo)}~${this.fmtHM(hi)} ← 未读到 zy.py 计划，按本账号启动时刻起排（不排到已过去的时间）`;
                 Utils.log("🎲", `本账号今日排程（${label}，执行点各账号独立、互不相同）：`
                     + points.map(x => this.fmtHM(x)).join(" / "));
@@ -11247,9 +11963,49 @@ const __scBgKeepAlive = (function() {
              · 还差不到 WAKE_HIT_WINDOW（5 秒，只容忍定时器提前几秒）→ 也认。
            命中即把该点标记为已用并落盘，保证同一个点只触发一次。 */
         hitWakePoint(now = Date.now(), apply = true) {
-            const p = this.todayPlan(now);
             const d = new Date(now);
             const curMin = d.getHours() * 60 + d.getMinutes();
+            const p = this.todayPlan(now);
+            /* 18 点后不看执行点：每次敲门都算命中（上一轮还在跑时由 ⑦ 让路），
+               于是一轮接一轮做到今天做完为止。这就是「18 点后按默认连续做」。
+               但 18 点后的**头 3 分钟**先不跑：计划只排到 18:00，脚本读不到 hold 标记
+               （zy.py 装扩展/校准期间置的那个），如果浏览器正好 18 点后才起来，
+               此刻直接开跑会被校准掐断（v0.75 修过的老问题）。这里用「今天第一次
+               18 点后敲门」当锚点等 3 分钟，之后一直连续跑。 */
+            if (curMin >= PLAN_CUTOFF_MIN) {
+                const t18 = Date.now();
+                let first18 = 0;
+                try {
+                    if (Number(GM_getValue("Config.after18Date", 0)) !== Utils.getTodayNum()) {
+                        GM_setValue("Config.after18Date", Utils.getTodayNum());
+                        GM_setValue("Config.after18At", t18);
+                        first18 = t18;
+                    } else {
+                        first18 = Number(GM_getValue("Config.after18At", 0)) || t18;
+                    }
+                } catch (_) { first18 = t18; }
+                if (t18 - first18 < 3 * 60 * 1000) {
+                    const once = Number(GM_getValue("Config.after18LogAt", 0)) || 0;
+                    if (t18 - once >= 30 * 60 * 1000) {
+                        try { GM_setValue("Config.after18LogAt", t18); } catch (_) {}
+                        Utils.log("⏸️", "18 点后第一轮先等 3 分钟：给 zy.py 留出装扩展/校准的时间"
+                            + "（计划不排 18 点后，读不到暂缓标记），之后一轮接一轮连续跑");
+                    }
+                    return { hit: false, plan: p, waitCalib: true };
+                }
+                /* 18 点后按 20 分钟节拍（对齐 yh.js 的 20 分钟定时）：
+                   上一轮结束不满 20 分钟就静默等，不再「每次敲门都开一轮」。
+                   以前没有这道闸门，一轮跑完 1~2 分钟、下一分钟又开一轮，
+                   22:06~22:14 那份日志里四个账号各刷了 4~5 轮空转。 */
+                const lastEnd = Number(GM_getValue(ROUND_END_KEY, 0)) || 0;
+                if (lastEnd > 0 && t18 >= lastEnd && (t18 - lastEnd) < AFTER18_IDLE_MS) {
+                    return {
+                        hit: false, plan: p, waitIdle: true,
+                        idleLeftMs: AFTER18_IDLE_MS - (t18 - lastEnd)
+                    };
+                }
+                return { hit: true, point: curMin, index: -1, plan: p, leadMs: 0, continuous: true };
+            }
             const secInMin = d.getSeconds() + d.getMilliseconds() / 1000;
             for (let i = 0; i < p.points.length; i++) {
                 if (p.used[i]) continue;
@@ -11382,11 +12138,17 @@ const __scBgKeepAlive = (function() {
             if (ran) {
                 const pl = this.todayPlan(now);
                 const left = pl.used.filter(x => !x).length;
+                /* 有续跑标记时下一个执行点不是真正的开跑时刻 —— 下一声敲门就会接着做，
+                   这里必须说清楚，否则日志会让人以为要等几十分钟。 */
+                const nm = (() => { try { return GM_getValue("Config.needMore", null); } catch (_) { return null; } })();
+                const moreTail = (nm && Number(nm.date) === Utils.getTodayNum())
+                    ? "；已留续跑标记，下一声敲门（1 分钟内）接着做，不占执行点"
+                    : "";
                 const tail = nextAt
                     ? `下一个执行点 ${this.fmt(nextAt)}（约 ${Math.max(0, Math.round((nextAt - now) / 60000))} 分钟后）`
                     : `今日 ${pl.points.length} 个执行点已全部跑完`;
                 Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟），`
-                    + `${tail}；今日排程 ${this.planSummary(pl)}，剩余 ${left} 点`);
+                    + `${tail}；今日排程 ${this.planSummary(pl)}，剩余 ${left} 点${moreTail}`);
             }
         },
 
@@ -11573,7 +12335,17 @@ const __scBgKeepAlive = (function() {
                 Utils.log("♻️", `清理孤儿运行锁（${this.fmt(orphanLock.ts)} 残留，已超过 ${Math.round(RUN_LOCK_TTL / 60000)} 分钟）`);
             }
 
-            /* ③ 运行时段以面板 Config.winTime 为准：cron 全天唤醒，这里才是闸门。
+            /* ②b 先读一次 zy.py 的计划（开机 → 收工）。
+               为什么必须排在时段判定之前：winCfg 现在是「有计划就用计划」，
+               计划没读进来时只能拿 09:00~23:00 兜底。如果先判时段再读计划，
+               就会出现死锁 —— 23:12 这种「计划说到 23:59、兜底时段 09~23 已过」的情况，
+               第一次判「不在时段」直接 return，永远走不到读计划那一步，
+               然后就整晚都不跑（线上 23:12 那次就是这样：4 个账号每分钟空唤醒）。
+               计划已经读过/正在限流重试时，这一步几乎无开销。 */
+            try { await this.ensureRunPlan(); } catch (_) {}
+
+            /* ③ 运行时段以 Config.winTime（默认 auto = 跟随 zy.py 计划）为准：
+               cron 全天唤醒，这里才是闸门。
                时段一结束就把运行痕迹（锁、认领、排期、变体缓存、节流计数）清干净，
                下一次开窗从全新状态开始 —— 定时模式下没有「卡住需要人手动重置」这回事了。
                今日进度（tasks / doneDate / edge / monthly / intl）不清，清了会重复做任务。 */
@@ -11587,12 +12359,11 @@ const __scBgKeepAlive = (function() {
                 }
                 this.clearClaim();
                 this.state("waiting", { runAt: next, inWindow: false });
-                const cfg = this.winCfg();
-                const span = cfg.allDay ? "全天不限" : `${this.fmtHM(cfg.startMin)}~${this.fmtHM(cfg.endMin)}`;
+                const span = this.winSpan();
                 const lastLog = Number(GM_getValue("Config.idleWakeLogAt", 0)) || 0;
                 if (now - lastLog >= 2 * 60 * 60 * 1000) {
                     GM_setValue("Config.idleWakeLogAt", now);
-                    Utils.log("🌙", `当前不在运行时段（${span}，以面板 Config.winTime 为准），本次唤醒不跑任务`);
+                    Utils.log("🌙", `当前不在运行时段（${span}），本次唤醒不跑任务`);
                 }
                 return { ran: false, reason: "window" };
             }
@@ -11644,6 +12415,28 @@ const __scBgKeepAlive = (function() {
                     }
                     return { ran: false, reason: "hold" };
                 }
+            }
+
+            /* ⑥a0' 18 点后第一轮还在 3 分钟等待窗内：直接结束这次敲门。
+               必须在这里拦 —— 下面「补跑」分支只认 `!peek.hit && ownerDead`，
+               若让它走到那里，会把这 3 分钟当成「上一轮被打断」当场开跑，
+               正好撞上 zy.py 的装扩展/校准。 */
+            if (peek.waitCalib) return { ran: false, reason: "waitCalib" };
+
+            /* ⑥a0'' 18 点后节拍未到（距上一轮结束不满 20 分钟）：静默等。
+               不能再往下面的分支走 —— 那里是 18 点前「未命中执行点」的话术，
+               18 点后没有执行点，打出来会是「下一执行点 今日已跑完」，误导人。 */
+            if (peek.waitIdle) {
+                const leftMs = Math.max(0, Number(peek.idleLeftMs) || 0);
+                if (!this.isBusy(now)) this.state("waiting", { runAt: now + leftMs, byPlan: true });
+                const quietAt = Number(GM_getValue("Config.after18IdleLogAt", 0)) || 0;
+                if (now - quietAt >= 10 * 60 * 1000) {
+                    GM_setValue("Config.after18IdleLogAt", now);
+                    Utils.log("💤", `18 点后节拍未到：上一轮结束才 `
+                        + `${Math.max(0, Math.round((AFTER18_IDLE_MS - leftMs) / 60000))} 分钟，`
+                        + `${Math.max(1, Math.ceil(leftMs / 60000))} 分钟后再开一轮（20 分钟一次）`);
+                }
+                return { ran: false, reason: "idle" };
             }
 
             /* ⑥a' 上一轮跑到一半被打断（CDP 导航顶掉页面 / 标签页被回收 / 后台 SW 被回收）：
@@ -11722,7 +12515,29 @@ const __scBgKeepAlive = (function() {
                 } catch (_) {}
             }
 
-            if (!peek.hit && !recover && !finaleCatchup) {
+            /* ⑥a''' 续跑标记：上一轮结束时「还有任务没做完，且确实推进过」（由 runNodes 写）。
+               18 点后本来就是每次敲门都命中；这一条主要解决 18 点前「执行点之间空等」
+               —— 用户要求「任务一直做别停」，不能做完一个节点就干等几十分钟。
+               30 分钟有效期 + 本轮结束会重写/清掉，不会变成隔夜残留。 */
+            let needMore = false;
+            if (!recover && !finaleCatchup && !ownerDead && !this.isBusy(now)) {
+                /* 18 点后一律走 20 分钟节拍，不认续跑标记 —— 否则 18 点前留下的标记
+                   （30 分钟有效）会让 18 点后的头几轮绕过节拍，又变成每分钟一轮。 */
+                const dn = new Date(now);
+                const after18Now = dn.getHours() * 60 + dn.getMinutes() >= PLAN_CUTOFF_MIN;
+                if (!after18Now) {
+                    try {
+                        const nm = GM_getValue("Config.needMore", null);
+                        if (nm && Number(nm.date) === todayNum && (Date.now() - (Number(nm.at) || 0)) < 30 * 60 * 1000) {
+                            GM_setValue("Config.needMore", null);
+                            needMore = true;
+                            Utils.log("🔁", "续跑：上一轮结束时还有任务没做完，本次敲门直接接着做（不占执行点）");
+                        }
+                    } catch (_) {}
+                }
+            }
+
+            if (!peek.hit && !peek.waitCalib && !recover && !finaleCatchup && !needMore) {
                 const nx = this.nextWakeAt(now);
                 /* ⚠ 只有「当下没有一轮在跑」时才写 waiting。
                    以前无条件写，等于每一次空敲门都把正在跑那一轮的 running 状态覆盖掉：
@@ -11748,6 +12563,19 @@ const __scBgKeepAlive = (function() {
             if (!recover && !finaleCatchup && this.isBusy(now)) {
                 const s = this.getState() || {};
                 let lastAct = Math.max(Number(s.at) || 0, Number(s.aliveAt) || 0);
+                /* ⓪ 快速让路（v0.79）：心跳每 20 秒一次，90 秒内还有活动就一定在跑，
+                   不必付 42 秒探活的代价。节点式执行让一轮变成最长 60 分钟，
+                   18 点后又是每分钟敲门 —— 不拦这一层，同一轮要被探活十几次，
+                   后台 CPU 全耗在「证明自己还活着」上。日志 10 分钟一条，不刷屏。 */
+                if (lastAct > 0 && (now - lastAct) < 90 * 1000) {
+                    const lastLog = Number(GM_getValue("Config.busyLogAt", 0)) || 0;
+                    if (now - lastLog >= 10 * 60 * 1000) {
+                        GM_setValue("Config.busyLogAt", now);
+                        Utils.log("🟡", `定时唤醒：上一轮还在执行中（${s.ctx || "未知"}，`
+                            + `${Math.round((now - lastAct) / 1000)} 秒前还有心跳），本分钟静默让路`);
+                    }
+                    return { ran: false, reason: "busy" };
+                }
                 /* ① 已经实测过「还活着」的话不用再等 42 秒探一次 */
                 const alive = ownerProbedAlive === true
                     ? true
@@ -11787,12 +12615,12 @@ const __scBgKeepAlive = (function() {
                补跑不走执行点（index=-1），排程里那个被中断的点仍然算「跑过」——
                它的活儿这一轮接手续做，不该再被算成一次新的执行点。 */
             let wakeHit;
-            if (recover || finaleCatchup) {
+            if (recover || finaleCatchup || needMore) {
                 const d0 = new Date(now);
                 wakeHit = {
                     hit: true, point: d0.getHours() * 60 + d0.getMinutes(),
                     index: -1, plan: peek.plan, leadMs: 0,
-                    recovered: !!recover, finale: !!finaleCatchup
+                    recovered: !!recover, finale: !!finaleCatchup, needMore: !!needMore
                 };
             } else {
                 wakeHit = this.hitWakePoint(now);
@@ -12007,8 +12835,7 @@ const __scBgKeepAlive = (function() {
 
         if (!force && !Sched.inWindow(Date.now())) {
             const next = Sched.alignToWindow(Date.now());
-            const cfg = Sched.winCfg();
-            const span = cfg.allDay ? "全天不限" : `${Sched.fmtHM(cfg.startMin)}~${Sched.fmtHM(cfg.endMin)}`;
+            const span = Sched.winSpan();
             Utils.log("🌙", `当前不在运行时段（${span}），已排到 ${Sched.fmt(next)} 开始，窗口外不会跑任务`);
             Sched.saveNext(next);
             Sched.clearClaim();
@@ -12276,7 +13103,10 @@ const __scBgKeepAlive = (function() {
         const wcfg = Sched.winCfg();
         text += `运行时段：${wcfg.allDay
             ? "全天不限（开始=结束，已关闭时段限制）"
-            : `${Sched.fmtHM(wcfg.startMin)}~${Sched.fmtHM(wcfg.endMin)}，每天 ${Sched.fmtHM(wcfg.startMin)} 开始`}\n`;
+            : `${Sched.fmtHM(wcfg.startMin)}~${Sched.fmtHM(wcfg.endMin)}`
+              + (wcfg.planUsed
+                  ? "（就是 zy.py 计划的开机~收工，配置项不参与）"
+                  : "（未读到 zy.py 计划，用的是配置兜底）")}\n`;
         text += `当前状态：${Sched.inWindow(now) ? "✅ 在运行时段内" : "🌙 时段外，窗口内不会开新的一轮"}\n`;
         text += `敲门节拍：@crontab 理论 ${CRON_WAKE_MS / 60000} 分钟一次，实测引擎会退避到约 20 分钟；`
             + `真正准点的是「定时执行」的整 ${SCHED_GRID} 分钟。敲门 ≠ 开跑\n`;
@@ -12320,16 +13150,18 @@ const __scBgKeepAlive = (function() {
         if (st && st.phase === "running" && !Sched.isBusy(now)) {
             text += `⚠️ 有一条 running 记录已经 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟没动静，下一次调度会自动回收它。\n\n`;
         }
-        text += "定时模式：@crontab 每分钟敲门一次（9-18 点），但敲门 ≠ 开跑。\n"
+        text += "定时模式：@crontab 每分钟敲门一次（9~23 点，与 zy.py 的 RUN_WINDOW 对齐），但敲门 ≠ 开跑；能不能跑只看 zy.py 计划。\n"
             + "两层随机：朱雀面板的「随机时间启动任务」在 9:00-15:00 内随机拉起 zy.py，"
             + "zy.py 把开机时刻写进计划文件，本脚本再把执行点撒在「开机时刻~收工时刻」之间；"
             + "读不到计划文件（无头模式 / GM 里残留旧地址 8080 / 未生成）时，不再用固定的上午/下午区间，"
             + "而是从本账号实际启动那一刻起排（落盘固定、当天稳定），把剩余时间铺满 —— \n"
-            + "启动起排：从启动时刻到收工线之间撒 10~20 个精确到分钟的随机执行点，"
+            + "启动起排：从启动时刻到收工线之间，按「一轮 ≈ 60 分钟」的间距撒 3~9 个精确到分钟的随机执行点"
+            + "（间隔约 70 分钟，点与点首尾相接）；命中一个点就连续做到盘点为空，"
+            + "循环期间撞到的后续执行点直接让路并合并进这一轮，"
             + "启动再晚也不会把点全排到已过去的时间导致空转；只有当前这一分钟正好是某个未跑过的执行点才真跑，其余敲门静默跳过。\n"
             + "执行点由「日期 + 本账号随机盐」确定性生成：区间四账号一致，执行点各账号互不相同"
             + "（不会同一分钟一起打接口）；到点那一分钟就叫醒并立即开跑，不用等下一个整点刻度；"
-            + "同一天稳定、跨天自动重建。窗口仍是面板 Config.winTime，18 点后不再安排执行点。\n"
+            + "同一天稳定、跨天自动重建。运行时段默认 auto（跟随 zy.py 计划的开机~收工），18 点后不再安排执行点。\n"
             + "浏览器关闭期间不会唤醒。\n"
             + "「运行阶段」长期停在「正在执行」而最后进展很久没动，说明那一轮卡住了，下一轮会回收它。\n"
             + "想立刻跑一轮：脚本菜单「🚀 立即运行」。";
