@@ -8,7 +8,7 @@
 
 ```
 .
-├── microsoft-rewards.user.js        ← 脚本源码（@version 是唯一版本来源）
+├── 微软积分（优化版）.user.js        ← 脚本源码（@version 是唯一版本来源）
 ├── .gitattributes  .gitignore       ← Git 专用文件，必须留在根目录
 ├── .gitea/workflows/sync-store.yml  ← Gitea Actions 专用路径，必须留在根目录
 └── tools/
@@ -26,29 +26,33 @@
 ## 发布链路
 
 ```
-本地改 microsoft-rewards.user.js（记得改 @version）
-        ↓ git push
-Gitea Actions: .gitea/workflows/sync-store.yml
+本地改 微软积分（优化版）.user.js（记得改 @version）
+        ↓
+本地执行 tools/sc_sync.py --push --url <webhook>
         ↓ 读根目录的 user.js + tools/release-notes/v<版本>.md
-tools/sc_sync.py --push  →  脚本猫用户 webhook  →  商店 #6006 生成新版本
+脚本猫用户 webhook  →  商店 #6006 生成新版本
         ↓ 容器下次启动
 tools/zy.py 的启动校准：已装 vX < 商店 vY → 自动更新 4 个账号的脚本
 ```
 
-### 一次性配置（三步）
+### 发版方式（本地 webhook，不依赖 CI）
 
-1. **脚本猫 webhook 地址**：登录 <https://scriptcat.org>，进用户设置里拿到 webhook 地址（形如
-   `https://scriptcat.org/api/v2/webhook/<token>`，可"刷新 token"重置）。这个地址本身就是凭据。
-2. **存进仓库 Secret**：Gitea → 仓库 → 设置 → Actions → Secrets，新增
-   `SCRIPTCAT_WEBHOOK`，值粘贴上一步的地址。
-3. **确认 Actions 能跑**：仓库 → Actions 页面能看到 `sync-store` 工作流。若实例没配 act_runner，
-   工作流会一直排队 —— 那就退回手动：本地 `git push` 后跑
-   `python tools/sc_sync.py --push --url <webhook地址>`。
+本环境没有 act_runner，`.gitea/workflows/sync-store.yml` 只保留手动入口、**不会被 push 触发**。
+发版统一走本地命令：
+
+```bash
+python tools/sc_sync.py --push --url <webhook地址>
+# 演练不提交：python tools/sc_sync.py --push --dry --url <webhook地址>
+```
+
+webhook 地址：登录 <https://scriptcat.org> → 用户设置里拿（形如
+`https://scriptcat.org/api/v2/webhook/<token>`，可"刷新 token"重置）。这个地址本身就是凭据，
+别提交进仓库；也可以设成环境变量 `SCRIPTCAT_WEBHOOK`，命令里就不用带 `--url`。
 
 ### 每次发版的固定动作
 
 ```bash
-# 1. 改根目录的 microsoft-rewards.user.js，把头部 @version 0.73 → 0.74
+# 1. 改根目录的 微软积分（优化版）.user.js，把头部 @version 0.73 → 0.74
 # 2. 写更新说明
 #    tools/release-notes/v0.74.md（商店页面用这个，短）
 #    tools/CHANGELOG.md 追加一节（完整版，含根因/验证方法）
@@ -67,7 +71,7 @@ python tools/sc_sync.py --push --dry --url <webhook地址>   # 演练，不提�
 
 ## 版本约定
 
-- `microsoft-rewards.user.js` 头部 `@version` 是唯一版本号，改代码必须同时改它，否则商店不会生成新版本。
+- `微软积分（优化版）.user.js` 头部 `@version` 是唯一版本号，改代码必须同时改它，否则商店不会生成新版本。
 - 线上比本地新时不要强推（`--force` 只在需要覆盖时用）。
 
 ## 授权说明

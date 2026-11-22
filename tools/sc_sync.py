@@ -18,26 +18,27 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))          # tools/
 ROOT = os.path.dirname(HERE)                               # 仓库根目录
 
-# 仓库里脚本的文件名。2026-11-23 由 zy.js 改成 .user.js 后缀，方便在 Gitea
-# 页面直接点安装，并移到根目录。旧名保留兜底：在还没同步这次改名的分支/clone 上跑也能找到文件。
-SCRIPT_FILE = "microsoft-rewards.user.js"
-SCRIPT_FILE_LEGACY = "zy.js"
+# 仓库里脚本的文件名（与脚本头 @name 一致，方便在 Gitea 页面直接点安装）。
+# 2026-11-23 定名：微软积分（优化版）.user.js，放在仓库根目录。
+# 旧名按优先级保留兜底：在还没同步这次改名的分支/clone 上跑也能找到文件。
+SCRIPT_FILE = "微软积分（优化版）.user.js"
+SCRIPT_FILE_LEGACY = ("microsoft-rewards.user.js", "zy.js")
 
 
 def script_path(name=None):
-    """取脚本文件的绝对路径（脚本在仓库根目录）；新名不存在就退回旧名。"""
+    """取脚本文件的绝对路径（脚本在仓库根目录）；新名不存在就依次退回旧名/旧布局。"""
     if name:
         return name if os.path.isabs(name) else os.path.join(ROOT, name)
-    p = os.path.join(ROOT, SCRIPT_FILE)
-    if not os.path.exists(p):
-        legacy = os.path.join(ROOT, SCRIPT_FILE_LEGACY)
-        if os.path.exists(legacy):
-            return legacy
-        # 兼容脚本还在 tools/ 里的旧布局
-        old = os.path.join(HERE, SCRIPT_FILE)
-        if os.path.exists(old):
-            return old
-    return p
+    candidates = [os.path.join(ROOT, SCRIPT_FILE)]
+    for legacy in SCRIPT_FILE_LEGACY:
+        candidates.append(os.path.join(ROOT, legacy))
+    # 兼容脚本还在 tools/ 里的旧布局
+    for legacy in (SCRIPT_FILE,) + tuple(SCRIPT_FILE_LEGACY):
+        candidates.append(os.path.join(HERE, legacy))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
 
 SITE = "https://scriptcat.org"
 DEFAULT_SCRIPT_ID = "6006"

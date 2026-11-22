@@ -1,15 +1,9 @@
 name: sync-store
 
-# push 到 main（且动到脚本/说明文件）时，把脚本推到脚本猫商店 #6006
+# 本环境没有 act_runner，push 触发只会让工作流一直排队，故去掉 push 触发器。
+# 发版走本地 webhook：python tools/sc_sync.py --push --url <webhook地址>
+# 本文件只保留手动入口（workflow_dispatch），将来若配了 runner 也能手动点一次。
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - 'microsoft-rewards.user.js'
-      - 'tools/release-notes/**'
-      - 'tools/CHANGELOG.md'
-      - 'tools/sc_sync.py'
-      - '.gitea/workflows/sync-store.yml'
   workflow_dispatch: {}
 
 jobs:
