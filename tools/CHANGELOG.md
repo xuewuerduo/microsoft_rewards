@@ -4,11 +4,69 @@
 
 ## 书写约定
 
-- **一节 = 一次发布**：标题为 `## v<版本号> · <YYYY-MM-DD>`，版本号取 `zy.js` 的 `@version`。
+- **一节 = 一次发布**：标题为 `## v<版本号> · <YYYY-MM-DD>`，版本号取根目录 `microsoft-rewards.user.js` 的 `@version`。
 - **必须写清四件事**：改了什么、为什么改（线上现象/根因）、影响哪些文件、怎么验证改对了。
 - **面向"跑的人"**：写的是「下次看日志该看哪一行」，不是代码 diff。
 - **文件指纹**用 `md5sum`（前 8 位即可）+ 行数，方便上传后核对是不是同一份。
-- 只影响 `zy.py` / `sc_deploy.py`、没动 `zy.js` 时，用 `## v<版本号> · <日期>（仅 zy.py / sc_deploy.py）`。
+- 只影响 `zy.py` / `sc_deploy.py`、没动脚本本体时，用 `## v<版本号> · <日期>（仅 zy.py / sc_deploy.py）`。
+
+---
+
+## v0.85 · 2026-11-23（发布链路验证版）
+
+**脚本行为与 v0.84 完全一致**，这次 bump 版本号只为验证一件事：仓库改名 + 目录重排之后，
+`git push` 还能不能顺着 Gitea Actions 自动把新版本发到脚本猫商店 #6006。
+
+### 为什么要专门发一版验证
+
+前面几轮把脚本从 `zy.js` 改名成 `microsoft-rewards.user.js`、又把它移进仓库根目录，
+其余文件收进 `tools/`。发版流水线 `sync-store` 是按**文件路径**触发的：
+
+```yaml
+on:
+  push:
+    paths:
+      - 'microsoft-rewards.user.js'        # 改名后必须跟着改，否则 push 不触发
+      - 'tools/release-notes/**'            # 原来在根目录
+      - 'tools/CHANGELOG.md'
+      - 'tools/sc_sync.py'
+```
+
+如果触发路径还写着旧名 `zy.js`，push 之后工作流根本不会启动，版本永远发不出去，
+而且日志里一点提示都没有 —— 所以要用一次真实发布来确认链路是通的。
+
+### 改了什么
+
+`microsoft-rewards.user.js`（13202 行，MD5 `2dd56467`）· `@version` 0.84 → 0.85
+**脚本逻辑一行没动**，只 bump 版本号。
+
+仓库层面的改动（已在之前的提交完成，这里汇总）：
+
+| 改动 | 说明 |
+|---|---|
+| 脚本改名 + 移到根目录 | `zy.js` → `microsoft-rewards.user.js`，方便在 Gitea 页面直接点安装 |
+| 其余文件收进 `tools/` | `zy.py` / `sc_deploy.py` / `sc_sync.py` / `sc_pub.py` / `CHANGELOG.md` / `release-notes/` |
+| 流水线路径同步 | `sync-store` 的触发路径和三条命令都改成 `tools/` 前缀 |
+| 发布脚本兜底 | `sc_sync.py` / `sc_pub.py` 增加 `ROOT` + `script_path()`，新名读不到退回旧名 zy.js 和旧布局；`sc_pub.py` 的登录态/profile 仍指向根目录，避免丢登录 |
+
+### 怎么验证改对了
+
+**① push 后看 Gitea Actions**（仓库 → Actions → `sync-store`）：
+
+- 本次提交动了 `microsoft-rewards.user.js` 和 `tools/release-notes/**`，两条路径都能触发，
+  应该看到一次新的 `sync-store` 运行；
+- 若一直「排队」= 实例没配 `act_runner`，工作流跑不起来（README 里有说明），
+  此时改用手动发版：`python tools/sc_sync.py --push --url <webhook地址>`。
+
+**② 确认商店真的收到**：
+
+```bash
+python tools/sc_sync.py --check
+# 期望：本地 v0.85 ｜ 线上 v0.85
+```
+
+**③ 容器下次启动**：4 个账号的脚本会从 v0.84 静默更新到 v0.85（脚本内容不变，
+只是版本号递增），日志里能看到 `✅ 账号 xxx 脚本已更新：v0.84 → v0.85`。
 
 ---
 
