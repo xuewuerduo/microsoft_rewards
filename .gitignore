@@ -1,0 +1,13 @@
+# 忽略测试与本地状态
+.chrome-test/
+.workbuddy/
+__pycache__/
+*.pyc
+*.log
+.env
+
+# 本地临时脚本（未纳入发布链路）
+yh.js
+cdp_update.py
+dump_sc_log.py
+fix_planurl.py
