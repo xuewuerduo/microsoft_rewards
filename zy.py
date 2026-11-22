@@ -325,6 +325,11 @@ SC_AUTO_UPDATE = os.getenv("SC_AUTO_UPDATE", "1").strip().lower() not in ("0", "
 SC_EXT_UPDATE = os.getenv("SC_EXT_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
 # 等「脚本猫首轮心跳」的上限秒数：等到就校准，等不到也按这个时间兜底校准一次
 SC_CALIB_WAIT_SEC = int(os.getenv("SC_CALIB_WAIT_SEC", "180") or 180)
+# 校准前等「正在跑的那一轮跑完」的上限秒数：校准会重建后台上下文，
+# 中途插进去会把那一轮掐断（线上 20:45 long 那轮就是这么丢的）
+SC_CALIB_ROUND_WAIT = int(os.getenv("SC_CALIB_ROUND_WAIT", "300") or 300)
+# 计划里「暂缓开跑」标记的有效期（秒）：zy.py 崩了也不会把脚本永久卡住
+PLAN_HOLD_TTL = int(os.getenv("PLAN_HOLD_TTL", "900") or 900)
 
 # 🖥️ 显示模式（默认无头浏览器省资源；检测未登录时按需拉起 noVNC 桌面让用户登录）
 # HEADLESS_MODE: auto(默认) / always(永远无头) / gui(始终带界面)
@@ -781,6 +786,10 @@ _NORUN_ALERTED = set()     # 已告警过的账号，避免每轮检查都重复
 _STALL_ALERTED = {}        # name -> 上次「停摆」告警时刻（隔一段时间才重复告警/重试修复）
 _STALL_TRIES = {}          # name -> 已经尝试过几次自动修复（第 2 次起改成 reload 扩展）
 _NORUN_LOCK = threading.Lock()
+# name -> 这一轮「真正在执行」的起始时刻（0 = 当前没有在跑）
+# 用途：开跑前版本校准会重建脚本猫后台上下文，正在跑的那一轮会被直接掐断，
+# 所以校准必须等所有账号都处于「轮次之间」的空窗。
+_ROUND_BUSY = {}
 
 # 脚本「跑到一半彻底停摆」判定：某账号最近一条脚本日志已经过去多少分钟
 STALL_ALERT_MIN = int(os.getenv("STALL_ALERT_MIN", "25"))
@@ -796,6 +805,36 @@ def mark_script_footprint(name):
         _SCRIPT_FOOTPRINT[name] = True
         _FIRST_LOG_TS.setdefault(name, time.time())
         _LAST_LOG_TS[name] = time.time()
+
+
+def _rounds_busy():
+    with _NORUN_LOCK:
+        return {n: t for n, t in _ROUND_BUSY.items() if t}
+
+
+def _wait_rounds_idle(timeout: float) -> bool:
+    """等所有账号的「这一轮」跑完 —— 轮次之间才是安全的校准窗口。
+
+    为什么要等：校准里的 reload 扩展 / 更新脚本会重建脚本猫的后台上下文，
+    正在跑的那一轮会当场断掉，剩下的任务只能等下一个执行点（线上 20:45 那次
+    long 就是这样白丢了一轮）。返回 True=都空闲；False=等到超时还有人在跑。
+    """
+    end = time.time() + max(0, timeout)
+    logged = False
+    while True:
+        busy = _rounds_busy()
+        if not busy:
+            return True
+        if time.time() >= end:
+            return False
+        if not logged:
+            logged = True
+            logger.info(f"⏳ 账号 {'、'.join(sorted(busy))} 正在执行本轮任务，"
+                        f"等这一轮跑完再校准（最多等 {int(timeout)} 秒："
+                        f"校准会重建后台上下文，中途插进去会把这一轮掐断）")
+        if _TERMINATED or _ALL_DONE.is_set():
+            return False
+        time.sleep(3)
 
 
 def _on_account_done(name, data):
@@ -891,6 +930,17 @@ def _sc_reader(name, port):
                                         else:
                                             tag = sname[:40]
                                         line = (lg.get("m") or "").replace("\n", " ↵ ")
+                                        # 轮次忙/闲：校准（reload 扩展 / 更新脚本）会重建后台上下文，
+                                        # 正在跑的那一轮会被掐断。用脚本自己的开始/结束日志判断空窗。
+                                        try:
+                                            if "本轮进入执行流程" in line:
+                                                with _NORUN_LOCK:
+                                                    _ROUND_BUSY[name] = time.time()
+                                            elif "本轮结束" in line or "本轮已释放" in line:
+                                                with _NORUN_LOCK:
+                                                    _ROUND_BUSY[name] = 0
+                                        except Exception:
+                                            pass
                                         if line.startswith("[QLREPORT-"):
                                             # QLREPORT 结构化报告：不打印，仅走通知
                                             _handle_ql_report(name, line)
@@ -1434,8 +1484,13 @@ def _ensure_ext_latest(name: str, port: int, user_dir: str = None,
         logger.info(f"  🔎 账号 {name} 认不到脚本猫扩展 ID，跳过扩展版本校准")
         return out
     try:
-        r = sd.ensure_ext_current(port, eid, ext_dir=ext_dir, allow_store=True,
-                                  log=lambda m: logger.info("   " + str(m).strip()))
+        fn = getattr(sd, "ensure_ext_current", None)
+        if not callable(fn):
+            logger.warning(f"  ⚠️ 账号 {name} 跳过扩展校准：同目录 sc_deploy.py 版本过旧"
+                           f"（缺少 ensure_ext_current），请把新版 sc_deploy.py 一起上传")
+            return False
+        r = fn(port, eid, ext_dir=ext_dir, allow_store=True,
+               log=lambda m: logger.info("   " + str(m).strip()))
     except Exception as e:
         logger.warning(f"  ⚠️ 账号 {name} 扩展版本检查异常（不影响任务继续）: {e}")
         return out
@@ -1529,16 +1584,27 @@ def _pre_task_calibrate(browsers, plan=None, max_wait=None):
             return
 
     logger.info(f"🧩 开跑前版本校准（{why}）：只对已运行的浏览器操作，扩展只 reload、不重启浏览器")
-    ths = []
-    for n, p, u in targets:
-        t = threading.Thread(target=_calibrate_one, args=(n, p, u),
-                             name=f"calib-{n}", daemon=True)
-        t.start()
-        ths.append(t)
-    for t in ths:
-        t.join(timeout=240)
-    _CALIBRATED.set()
-    logger.info("🧩 开跑前版本校准结束（本次运行不再重复检查）")
+    try:
+        if not _wait_rounds_idle(SC_CALIB_ROUND_WAIT):
+            logger.info("⏭️ 仍有一轮没跑完，本次跳过版本校准（下次任务开始前再校准，避免掐断正在跑的轮次）")
+            return
+        ths = []
+        for n, p, u in targets:
+            t = threading.Thread(target=_calibrate_one, args=(n, p, u),
+                                 name=f"calib-{n}", daemon=True)
+            t.start()
+            ths.append(t)
+        for t in ths:
+            t.join(timeout=240)
+        logger.info("🧩 开跑前版本校准结束（本次运行不再重复检查）")
+    finally:
+        _CALIBRATED.set()
+        # 无论校准成功、失败还是被跳过，都必须放行脚本 —— 否则 hold 只能靠有效期兜底，
+        # 白白耽误一个执行点。
+        try:
+            set_plan_hold(False)
+        except Exception as e:
+            logger.warning(f"⚠️ 解除「暂缓开跑」标记失败（脚本会在有效期后自行放行）: {e}")
 
 
 def launch_chrome(user_dir: str, port: int = 0, headless: bool = True):
@@ -3434,18 +3500,12 @@ def _verify_plan_http(port: int = 0):
     return False
 
 
-def write_run_plan(plan: dict, run_seconds: int):
-    """写出本次计划，供「脚本猫」在 [开机时刻, 收工时刻] 之间二次随机执行"""
-    dl = plan.get("deadline")
-    data = {
-        "date": f"{datetime.now():%Y-%m-%d}",
-        "window": plan.get("window") or "",
-        "startAt": plan["start_at"].isoformat(timespec="seconds"),
-        "runUntil": dl.isoformat(timespec="seconds") if dl else None,
-        "runSeconds": run_seconds,
-        "ts": int(time.time() * 1000),
-    }
-    text = json.dumps(data, ensure_ascii=False, indent=2)
+# 最近一次写出的计划体：set_plan_hold() 要在原样基础上只改 hold 字段
+_PLAN_LAST = {}
+
+
+def _write_plan_text(text: str) -> list:
+    """把计划体写到所有出口（/app/data、noVNC 静态目录、websockify 目录）"""
     dests = list(RUN_PLAN_FILES)
     for d in _websockify_web_dirs():
         p = os.path.join(d, "zy-run-plan.json")
@@ -3460,12 +3520,63 @@ def write_run_plan(plan: dict, run_seconds: int):
             ok.append(p)
         except Exception as e:
             logger.warning(f"  ⚠️ 计划文件写入失败 {p}: {e}")
+    return ok
+
+
+def write_run_plan(plan: dict, run_seconds: int, hold: bool = False):
+    """写出本次计划，供「脚本猫」在 [开机时刻, 收工时刻] 之间二次随机执行。
+
+    hold=True 时在计划里带一个「暂缓开跑」标记：脚本读到它就先不跑，只敲心跳，
+    等 zy.py 把「装扩展 / 装脚本 / 版本校准」全做完再放行。这样校准永远发生在
+    任务真正开跑之前，不会掐断已经开始的那一轮。
+    """
+    dl = plan.get("deadline")
+    data = {
+        "date": f"{datetime.now():%Y-%m-%d}",
+        "window": plan.get("window") or "",
+        "startAt": plan["start_at"].isoformat(timespec="seconds"),
+        "runUntil": dl.isoformat(timespec="seconds") if dl else None,
+        "runSeconds": run_seconds,
+        "ts": int(time.time() * 1000),
+        "hold": bool(hold),
+        "holdUntil": int((time.time() + PLAN_HOLD_TTL) * 1000) if hold else 0,
+    }
+    _PLAN_LAST.clear()
+    _PLAN_LAST.update(data)
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    ok = _write_plan_text(text)
     logger.info(f"📋 任务计划：开机 {plan['start_at']:%H:%M}"
                 + (f"，收工 {dl:%H:%M}" if dl else "")
-                + f"；已写入 {len(ok)} 处（{('、'.join(ok)) or '无'}）")
+                + f"；已写入 {len(ok)} 处（{('、'.join(ok)) or '无'}）"
+                + (f"；⏸️ 已置「暂缓开跑」（{PLAN_HOLD_TTL} 秒内失效），等版本校准完再放行" if hold else ""))
     # 关键一步：自己挂独立端口的只读接口（不占 GUI 的 8080），脚本猫从这里读
     port = ensure_plan_http(text)
     _verify_plan_http(port)
+
+
+def set_plan_hold(hold: bool, ttl: int = 0):
+    """改写计划里的「暂缓开跑」标记（校准前拦一下，校准完立刻放行）。
+
+    只改这一个字段并重写同一份计划，不动执行点所依赖的开机/收工时刻，
+    所以脚本侧的排程不会因此重算。
+    """
+    data = dict(_PLAN_LAST)
+    if not data:
+        return False
+    ttl = ttl or PLAN_HOLD_TTL
+    data["hold"] = bool(hold)
+    data["holdUntil"] = int((time.time() + ttl) * 1000) if hold else 0
+    data["ts"] = int(time.time() * 1000)
+    _PLAN_LAST.clear()
+    _PLAN_LAST.update(data)
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    _write_plan_text(text)
+    ensure_plan_http(text)
+    if hold:
+        logger.info(f"⏸️ 已置「暂缓开跑」标记（{ttl} 秒后自动失效，防脚本被永久卡住）")
+    else:
+        logger.info("🔓 已放行：计划里的「暂缓开跑」已解除，脚本下一个执行点即可开跑")
+    return True
 
 
 def main():
@@ -3534,7 +3645,7 @@ def main():
     run_seconds = _clamp_run_seconds(run_seconds, plan)
     if run_seconds < 0:
         return
-    write_run_plan(plan, run_seconds)
+    write_run_plan(plan, run_seconds, hold=bool(SC_AUTO_UPDATE or SC_EXT_UPDATE))
 
     # 启动浏览器前先获取热搜词写入文件（供「脚本猫-微软积分商城签到脚本」读取）
     generate_hotboard()
@@ -3851,14 +3962,21 @@ def main():
     if ALERT_NO_RUN and SC_LOG_CAPTURE:
         threading.Thread(target=_no_run_watch, name="no-run-watch", daemon=True).start()
 
-    # 🧩 开跑前一次性版本校准（脚本 + 扩展插件）：等脚本猫首轮心跳到了再动手，
-    #    启动阶段不 reload，避免刚起来就把后台上下文打断；只做一次。
+    # 🧩 开跑前一次性版本校准（脚本 + 扩展插件）：
+    #    写计划时已经置了「暂缓开跑」，所以脚本不会抢先开跑；这里等首轮心跳 +
+    #    轮次空窗，再统一校准一次，结束后放行。
     if (SC_AUTO_UPDATE or SC_EXT_UPDATE) and browsers:
         max_wait = SC_CALIB_WAIT_SEC if SC_LOG_CAPTURE else min(30, max(5, SC_CALIB_WAIT_SEC))
         if not SC_LOG_CAPTURE:
             logger.info(f"ℹ️  未开启脚本猫日志采集（等不到首轮心跳）→ {max_wait} 秒后直接校准版本")
         threading.Thread(target=_pre_task_calibrate, args=(browsers, plan, max_wait),
                          name="pre-task-calibrate", daemon=True).start()
+    else:
+        # 没有可校准的对象（或校准被环境变量关掉）：立刻放行，别让脚本白等
+        try:
+            set_plan_hold(False)
+        except Exception:
+            pass
 
     try:
         # 保持运行，等待「脚本猫-微软积分商城签到脚本」完成（心跳每 1 小时汇报一次；全部账号完成后提前退出）

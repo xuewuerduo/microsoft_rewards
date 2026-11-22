@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      0.74
+// @version      0.75
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；已适配 zy 版逻辑（每日随机排程、中文热搜、llq.py 上报、多账号 CDP 端口）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -11006,6 +11006,15 @@ const __scBgKeepAlive = (function() {
                 boot: this.bootId(),
                 fetchedAt: Date.now()
             };
+            /* zy.py 的「暂缓开跑」标记：它在装扩展 / 校准版本期间置上，做完立刻解除。
+               读到就先别开跑 —— 校准（reload 扩展 / 更新脚本）会重建后台上下文，
+               此时已经开跑的那一轮会被当场掐断（线上 20:45 long 就是这么丢的）。
+               holdUntil 是兜底有效期：zy.py 崩了也不会把脚本永久卡住。 */
+            let holdUntil = Number(data.holdUntil) || 0;
+            if (holdUntil > 0 && holdUntil < 1e12) holdUntil *= 1000;   // 兼容秒级写法
+            try {
+                GM_setValue("Config.planHoldUntil", (data.hold && holdUntil > Date.now()) ? holdUntil : 0);
+            } catch (_) {}
             GM_setValue(PLAN_CACHE_KEY, rec);
             return this.planRange();
         },
@@ -11052,6 +11061,21 @@ const __scBgKeepAlive = (function() {
                     + `今日执行点先按「唤醒分布」撒点，${Math.round(PLAN_RETRY_MS / 60000)} 分钟后自动重试`);
             }
             return null;
+        },
+
+        /* 主动重读一次计划里的 hold 标记（绕过 planRange 缓存）。
+           hold 只在「确实要开跑」时才查，所以这点额外请求可以忽略；
+           15 秒节流，避免同一分钟内重复拉。 */
+        async refreshPlanHold() {
+            const now = Date.now();
+            if (this._holdTryAt && now - this._holdTryAt < 15000) return;
+            this._holdTryAt = now;
+            try { await this.fetchRunPlan(); } catch (_) {}
+        },
+
+        planHoldLeft() {
+            const hu = Number(GM_getValue("Config.planHoldUntil", 0)) || 0;
+            return hu > Date.now() ? Math.ceil((hu - Date.now()) / 1000) : 0;
         },
 
         todayPlan(now = Date.now()) {
@@ -11603,6 +11627,24 @@ const __scBgKeepAlive = (function() {
                （唯一例外：上一轮心跳超时，此时会探活一次确认死没死，见 ⑥a'。）
                peek（apply=false）只看不占：万一后面发现上一轮还在跑，这个点还能留到下一分钟。 */
             let peek = this.hitWakePoint(now, false);
+
+            /* ⑥a0 zy.py 正在装扩展 / 校准脚本：计划里带「暂缓开跑」就先别跑。
+               校准会重建脚本猫的后台上下文，已经开跑的那一轮会被当场掐断
+               （线上 20:45 long 那轮跑到一半、20:46 install success 之后就没了）。
+               放行通常只要几十秒；holdUntil 到期自动失效，zy.py 崩了也不会永久卡住。 */
+            if (peek.hit || ownerDead) {
+                await this.refreshPlanHold();
+                const holdLeft = this.planHoldLeft();
+                if (holdLeft > 0) {
+                    const once = Number(GM_getValue("Config.planHoldLogAt", 0)) || 0;
+                    if (Date.now() - once >= 5 * 60 * 1000) {
+                        GM_setValue("Config.planHoldLogAt", Date.now());
+                        Utils.log("⏸️", `zy.py 正在安装/校准脚本猫（还有 ${holdLeft} 秒失效）：`
+                            + `本次暂不开跑，放行后下一个执行点立刻补上`);
+                    }
+                    return { ran: false, reason: "hold" };
+                }
+            }
 
             /* ⑥a' 上一轮跑到一半被打断（CDP 导航顶掉页面 / 标签页被回收 / 后台 SW 被回收）：
                那一轮停在哪就是哪，剩下的任务全都还没做，而 tasks 的日期标记只写成功的
