@@ -1,4 +1,4 @@
-"""sc_pub.py —— 把 zy.js 发布/更新到 scriptcat.org 自己的脚本仓库
+"""sc_pub.py —— 把脚本文件发布/更新到 scriptcat.org 自己的脚本仓库
 
 为什么单独一个脚本：发布需要登录态，而登录态只能来自真实浏览器窗口。
 这里用一个专用 profile（.chrome-test/publish-profile）保存登录，之后每次
@@ -8,7 +8,7 @@
   python sc_pub.py --login      首次：弹出窗口，你在里面登录一次（登录态落盘保存）
   python sc_pub.py --status     看登录态 + 线上版本 vs 本地版本
   python sc_pub.py --dump       打开编辑页导出表单结构（调试用）
-  python sc_pub.py --publish    上传 zy.js + 更新说明
+  python sc_pub.py --publish    上传脚本 + 更新说明
 
 登录态检测：先记下匿名 cookie 名单，出现新 cookie 即认为已登录。
 """
@@ -21,6 +21,10 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+# 仓库里脚本的文件名（2026-11-23 由 zy.js 改成 .user.js 后缀）
+SCRIPT_FILE = "microsoft-rewards.user.js"
+SCRIPT_FILE_LEGACY = "zy.js"
 
 import sc_deploy as sd  # noqa: E402
 
@@ -381,15 +385,15 @@ def cmd_dump(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="发布 zy.js 到 scriptcat.org")
+    ap = argparse.ArgumentParser(description="发布脚本到 scriptcat.org")
     ap.add_argument("--login", action="store_true", help="打开窗口登录并保存登录态")
     ap.add_argument("--status", action="store_true", help="看线上/本地版本与登录态")
     ap.add_argument("--dump", action="store_true", help="导出编辑页表单结构（调试）")
     ap.add_argument("--probe", action="store_true", help="用保存的登录态试接口")
-    ap.add_argument("--publish", action="store_true", help="发布 zy.js + 更新说明")
+    ap.add_argument("--publish", action="store_true", help="发布脚本 + 更新说明")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--profile", default=DEFAULT_PROFILE)
-    ap.add_argument("--code", default="zy.js")
+    ap.add_argument("--code", default=SCRIPT_FILE)
     ap.add_argument("--notes", default="")
     ap.add_argument("--script-id", default="6006")
     ap.add_argument("--dry", action="store_true", help="只演练不提交")

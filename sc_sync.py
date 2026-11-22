@@ -1,4 +1,4 @@
-"""sc_sync.py —— 仓库 push 后把 zy.js 同步到脚本猫商店 #6006
+"""sc_sync.py —— 仓库 push 后把脚本文件同步到脚本猫商店 #6006
 
 两条用法：
   1) 本地手动：python sc_sync.py --check
@@ -17,6 +17,23 @@ import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# 仓库里脚本的文件名。2026-11-23 由 zy.js 改成 .user.js 后缀，方便在 Gitea
+# 页面直接点安装。旧名保留兜底：在还没同步这次改名的分支/clone 上跑也能找到文件。
+SCRIPT_FILE = "microsoft-rewards.user.js"
+SCRIPT_FILE_LEGACY = "zy.js"
+
+
+def script_path(name=None):
+    """取脚本文件的绝对路径；未显式指定时，新名不存在就退回旧名。"""
+    if name:
+        return name if os.path.isabs(name) else os.path.join(HERE, name)
+    p = os.path.join(HERE, SCRIPT_FILE)
+    if not os.path.exists(p):
+        legacy = os.path.join(HERE, SCRIPT_FILE_LEGACY)
+        if os.path.exists(legacy):
+            return legacy
+    return p
+
 SITE = "https://scriptcat.org"
 DEFAULT_SCRIPT_ID = "6006"
 NOTES_DIR = os.path.join(HERE, "release-notes")
@@ -29,7 +46,7 @@ def meta_version(code):
 
 
 def local_version(path=None):
-    with open(path or os.path.join(HERE, "zy.js"), encoding="utf-8") as f:
+    with open(script_path(path), encoding="utf-8") as f:
         return meta_version(f.read())
 
 
@@ -141,12 +158,12 @@ def cmd_push(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="把 zy.js 同步到脚本猫商店")
+    ap = argparse.ArgumentParser(description="把脚本文件同步到脚本猫商店")
     ap.add_argument("--check", action="store_true", help="对比本地/线上版本")
     ap.add_argument("--push", action="store_true", help="推送更新")
     ap.add_argument("--url", default=os.getenv("SCRIPTCAT_WEBHOOK", ""),
                     help="脚本猫用户 webhook 地址（或环境变量 SCRIPTCAT_WEBHOOK）")
-    ap.add_argument("--code", default="zy.js")
+    ap.add_argument("--code", default=SCRIPT_FILE)
     ap.add_argument("--notes", default="auto")
     ap.add_argument("--script-id", default=DEFAULT_SCRIPT_ID)
     ap.add_argument("--format", type=int, default=1, choices=sorted(FORMATS))

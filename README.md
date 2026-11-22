@@ -6,10 +6,10 @@
 
 | 文件 | 说明 |
 |---|---|
-| `zy.js` | 脚本源码（`@version` 是唯一版本来源） |
+| `microsoft-rewards.user.js` | 脚本源码（`@version` 是唯一版本来源；`.user.js` 后缀可在 Gitea 页面直接点安装） |
 | `zy.py` | 容器里的调度器：拉起多账号浏览器、写运行计划、挂日志采集、启动时校准脚本版本 |
 | `sc_deploy.py` | 脚本猫部署工具（装扩展、装脚本、授权 Cookie、更新版本） |
-| `sc_sync.py` | 把 `zy.js` 推到商店（本地手动 / CI 自动都用它） |
+| `sc_sync.py` | 把脚本文件推到商店（本地手动 / CI 自动都用它） |
 | `sc_pub.py` | 走浏览器登录态的发布工具（备用，商店 webhook 不通时用） |
 | `CHANGELOG.md` | 完整更新说明（一个版本一节，倒序） |
 | `release-notes/v<版本>.md` | 推到商店页面的精简更新说明 |
@@ -18,10 +18,10 @@
 ## 发布链路
 
 ```
-本地改 zy.js（记得改 @version）
+本地改 microsoft-rewards.user.js（记得改 @version）
         ↓ git push
 Gitea Actions: .gitea/workflows/sync-store.yml
-        ↓ 读 zy.js + release-notes/v<版本>.md
+        ↓ 读 microsoft-rewards.user.js + release-notes/v<版本>.md
 sc_sync.py --push  →  脚本猫用户 webhook  →  商店 #6006 生成新版本
         ↓ 容器下次启动
 zy.py 的启动校准：已装 vX < 商店 vY → 自动更新 4 个账号的脚本
@@ -40,7 +40,7 @@ zy.py 的启动校准：已装 vX < 商店 vY → 自动更新 4 个账号的脚
 ### 每次发版的固定动作
 
 ```bash
-# 1. 改 zy.js，把头部 @version 0.73 → 0.74
+# 1. 改 microsoft-rewards.user.js，把头部 @version 0.73 → 0.74
 # 2. 写更新说明
 #    release-notes/v0.74.md（商店页面用这个，短）
 #    CHANGELOG.md 追加一节（完整版，含根因/验证方法）
@@ -59,7 +59,7 @@ python sc_sync.py --push --dry --url <webhook地址>   # 演练，不提交
 
 ## 版本约定
 
-- `zy.js` 头部 `@version` 是唯一版本号，改代码必须同时改它，否则商店不会生成新版本。
+- `microsoft-rewards.user.js` 头部 `@version` 是唯一版本号，改代码必须同时改它，否则商店不会生成新版本。
 - 线上比本地新时不要强推（`--force` 只在需要覆盖时用）。
 
 ## 授权说明

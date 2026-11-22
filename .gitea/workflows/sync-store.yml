@@ -1,11 +1,11 @@
 name: sync-store
 
-# push 到 main（且动到脚本/说明文件）时，把 zy.js 推到脚本猫商店 #6006
+# push 到 main（且动到脚本/说明文件）时，把脚本推到脚本猫商店 #6006
 on:
   push:
     branches: [main, master]
     paths:
-      - 'zy.js'
+      - 'microsoft-rewards.user.js'
       - 'release-notes/**'
       - 'CHANGELOG.md'
       - 'sc_sync.py'
