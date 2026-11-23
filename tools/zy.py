@@ -101,6 +101,11 @@
                                 ② 脚本报「今日所选任务已全部完成…休眠」；③ 全部账号完成后的收尾。
                                 每个账号独立关闭，全关完主循环立刻结束，不挂到收工时刻。
                                 设 0 = 单账号完成时不立刻关（留到全部完成后的收尾），排查用。
+ 可选 SC_IDLE_CLOSE_MIN        连续多少分钟一条脚本日志都没有，就关掉该账号的浏览器（默认 0=不启用）。
+                                设成 120 这类值时：只在「②自动修复也救不回来」之后才动手，
+                                关掉后该账号按「未完成」处理，其余账号照跑；全部收尾后
+                                面板日志会打「🧹 账号 X 已 N 分钟没有任何脚本日志 → 关闭…」。
+                                用来治「报不出完成、一直挂到收工」的账号（5 个就是 5 个常驻 Chromium）。
  可选 SC_CLOSE_DELAY           账号报「全部完成」后等多少秒再关浏览器（默认 20；0=立刻关）。
                                 留这 20 秒是为了让脚本把 finish()/状态落盘/「本轮结束」
                                 这条尾巴跑完，否则轮次忙标记会一直停在「忙」。
@@ -448,6 +453,12 @@ SC_CLOSE_DELAY = int(os.getenv("SC_CLOSE_DELAY", "20") or 20)
 # 每个账号独立关闭，全部关掉后主循环提前结束，不必挂到收工时刻。
 # 设 0 = 单账号完成时不立刻关（留到全部完成后的收尾），排查用。
 SC_CLOSE_ON_DONE = os.getenv("SC_CLOSE_ON_DONE", "1").strip().lower() not in ("0", "false", "no", "off")
+# 账号连续多少分钟「一条脚本日志都没有」就直接关掉它的浏览器（省内存/省 CPU）。
+# 默认 0 = 关闭这个兜底（不动它，行为与以前一致）。为什么要有：
+#   脚本报不出「全部完成」的账号（桌面任务缺 Chrome、国际版活动没下发 hash、
+#   Cookie 掉登录……）会一直挂到收工 —— 5 个账号就是 5 个常驻 Chromium。
+# 取值要明显大于 STALL_ALERT_MIN（默认 40），否则自动修复还没试完浏览器就被关了。
+SC_IDLE_CLOSE_MIN = int(os.getenv("SC_IDLE_CLOSE_MIN", "0") or 0)
 SC_EXT_ID = "ndcooeababalnlpkfedmmbbbgkljhpjf"  # 脚本猫扩展 ID（Chrome 商店安装版）。仅为额外线索，
 #   识别主要靠探测 IndexedDB（不依赖扩展名/ID，扩展猫/改名版同样适用）
 
@@ -852,7 +863,8 @@ def _handle_ql_report(name, line):
 # ==============================================
 _ACCOUNT_BROWSERS = {}    # name -> {"pid":.., "port":..}
 _ACCOUNT_END_DATA = {}    # name -> 结束报告数据
-_ACCOUNT_DONE = {}        # name -> True
+_ACCOUNT_DONE = {}        # name -> True（含「已完成」与「零输出被关」两种）
+_ACCOUNT_FAILED = set()   # name（因长时间零输出被关掉的账号，收尾要如实说明）
 _ACCOUNT_LOCK = threading.Lock()
 _ALL_DONE = threading.Event()
 
@@ -931,16 +943,20 @@ def _wait_rounds_idle(timeout: float) -> bool:
         time.sleep(3)
 
 
-def _on_account_done(name, data, reason="任务全部完成"):
-    """账号任务全部完成：保存进度 → 关闭该浏览器 → 全部完成则汇总通知并停止
+def _on_account_done(name, data, reason="任务全部完成", ok=True):
+    """账号收尾：关闭该浏览器 → 全部收尾则汇总通知并停止
 
-    reason 只影响日志用词（达标 / 今日无待办休眠），关闭逻辑一致。
+    reason 只影响日志用词（达标 / 今日无待办休眠 / 零输出被关），关闭逻辑一致。
+    ok=False 表示「不是真的做完」（长时间零输出，关掉省资源）：
+    不发明「今日任务已完成」的通知，收尾汇总里也会单独列出来。
     """
     with _ACCOUNT_LOCK:
         if _ACCOUNT_DONE.get(name):
             return
         _ACCOUNT_DONE[name] = True
         _ACCOUNT_END_DATA[name] = data
+        if not ok:
+            _ACCOUNT_FAILED.add(name)
         info = _ACCOUNT_BROWSERS.get(name)
     if info and (info.get("port") or info.get("pid")):
         delay = max(0, SC_CLOSE_DELAY)
@@ -953,7 +969,7 @@ def _on_account_done(name, data, reason="任务全部完成"):
             except Exception as e:
                 logger.debug(f"  关闭 {name} 浏览器异常: {e}")
 
-        if not SC_CLOSE_ON_DONE:
+        if not SC_CLOSE_ON_DONE and ok:
             logger.info(f"ℹ️ 账号 {name} {reason}，但 SC_CLOSE_ON_DONE=0 → 暂不关它的浏览器")
         elif delay:
             # QLREPORT-END 打在每轮汇总里，紧接着还有 finish()/状态落盘/「本轮结束」日志。
@@ -963,18 +979,33 @@ def _on_account_done(name, data, reason="任务全部完成"):
             t.start()
         else:
             _close_later()
-    if data is None:
+    if data is None and ok:
         # 休眠场景（任务早已完成、本次只是复检）→ 关闭浏览器并通知，节省资源
         send("【账号完成】", f"✅ 账号 {name} 今日任务已完成，浏览器已关闭（休眠节省资源）。")
     with _ACCOUNT_LOCK:
         remaining = [n for n, _ in _ACCOUNT_BROWSERS.items() if not _ACCOUNT_DONE.get(n)]
         all_names = list(_ACCOUNT_BROWSERS.keys())
     if not remaining and all_names:
+        with _ACCOUNT_LOCK:
+            failed = set(_ACCOUNT_FAILED)
         parts = []
         for n in all_names:
             d = _ACCOUNT_END_DATA.get(n)
-            parts.append(f"【{n}】\n" + (_fmt_end_report(d) if d else "已完成"))
-        send("【任务完成】全部账号已完成", "✅ 全部账号任务已完成！\n\n" + "\n\n".join(parts))
+            if d:
+                parts.append(f"【{n}】\n" + _fmt_end_report(d))
+            elif n in failed:
+                parts.append(f"【{n}】\n⚠️ 长时间没有脚本日志，已关闭浏览器（未确认完成）")
+            else:
+                parts.append(f"【{n}】\n已完成")
+        if failed:
+            if len(failed) >= len(all_names):
+                head_line = f"⚠️ 全部 {len(all_names)} 个账号长时间没有输出，已关闭浏览器（今日任务未完成）。"
+            else:
+                head_line = (f"⚠️ {len(failed)}/{len(all_names)} 个账号长时间没有输出，"
+                             f"已关闭浏览器；其余已完成。")
+            send("【任务结束】全部账号已收尾", head_line + "\n\n" + "\n\n".join(parts))
+        else:
+            send("【任务完成】全部账号已完成", "✅ 全部账号任务已完成！\n\n" + "\n\n".join(parts))
         _ALL_DONE.set()
 
 
@@ -1143,10 +1174,14 @@ def _no_run_watch():
        （连心跳都没有）→ 告警。一旦采集到任意脚印就永久跳过该账号（本次任务内）。
     ② 跑到一半停摆：本来有日志，但最近一条已经过去 STALL_ALERT_MIN 分钟，
        而账号还没报「全部完成」→ 告警 + 自动修复（见 _stall_repair）。
-
     ② 是实跑日志里那台 marvin 的写照：15:04 静默更新成功之后，它的浏览器一直开着，
     却再也不敲门 —— 三个多小时里 4 个账号只有 3 个在干活，光看「有没有脚印」的
-    ① 号检查是发现不了的（它早就有脚印了）。"""
+    ① 号检查是发现不了的（它早就有脚印了）。
+
+    ③ 长时间零输出：连续 SC_IDLE_CLOSE_MIN 分钟一条日志都没有（默认 0=不启用）
+       → 直接关掉这个账号的浏览器。② 是「先救」，③ 是「救不活就止损」：
+       脚本报不出「全部完成」的账号会一直挂到收工，5 个账号就是 5 个常驻 Chromium。
+       所以 ③ 排在 ② 前面判断，止损后 ② 不会再对已收尾的账号做修复。"""
     check_every = 120    # 每 2 分钟检查一次
     while True:
         time.sleep(check_every)
@@ -1179,11 +1214,35 @@ def _no_run_watch():
             send(f"【告警】账号 {n} 脚本未运行", msg)
             logger.warning(f"🚨 账号 {n} 脚本未运行（{NO_RUN_GRACE_MIN} 分钟内零脚印）")
 
+        # ── ③ 长时间零输出 → 直接关掉这个账号的浏览器 ──
+        #   为什么放在 ② 之前：② 是「先试着救」（reload 扩展），救了两轮还不出声，
+        #   再占着内存就没意义了。只有 SC_IDLE_CLOSE_MIN>0 时才启用。
+        if SC_IDLE_CLOSE_MIN > 0:
+            for n in names:
+                if n in done or _ACCOUNT_DONE.get(n) or n not in ports:
+                    continue
+                # 基准点：有日志就用最近一条，从没出过声就用浏览器启动时刻
+                ref = last_ts.get(n) or starts.get(n)
+                if not ref or (now - ref) < SC_IDLE_CLOSE_MIN * 60:
+                    continue
+                silent = int((now - ref) / 60)
+                logger.warning(f"🧹 账号 {n} 已 {silent} 分钟没有任何脚本日志"
+                               f"（阈值 {SC_IDLE_CLOSE_MIN} 分钟）→ 关闭它的浏览器省资源"
+                               f"（今天该账号的任务算放弃，其余账号不受影响）")
+                send(f"【账号止损】{n} 长时间无输出",
+                     f"账号 {n} 最近 {silent} 分钟没有任何脚本日志，已关闭它的浏览器省资源。\n"
+                     f"该账号今日任务按「未完成」处理；其余账号继续跑。\n"
+                     f"常见原因：桌面任务缺 Chrome、国际版活动没下发、Cookie 掉登录。\n"
+                     f"排查完想让它在下一轮自动恢复：面板重新跑一次任务即可。")
+                _on_account_done(n, None, ok=False,
+                                 reason=f"长时间无输出（{silent} 分钟）")
+                done.add(n)
+
         # ── ② 跑到一半停摆 ──
         if STALL_ALERT_MIN <= 0:
             continue
         for n in names:
-            if n in done or n not in feet:
+            if n in done or _ACCOUNT_DONE.get(n) or n not in feet:
                 continue
             ts = last_ts.get(n)
             if not ts or (now - ts) < STALL_ALERT_MIN * 60:
@@ -4130,6 +4189,14 @@ def main():
     logger.info(f"  CLOSE_AFTER = {CLOSE_AFTER}")
     logger.info(f"  CDP_BASE_PORT = {CDP_BASE_PORT}")
     logger.info(f"  HEADLESS_MODE = {HEADLESS_MODE}  DESKTOP_ENABLE = {DESKTOP_ENABLE}")
+    if SC_IDLE_CLOSE_MIN > 0:
+        logger.info(f"  SC_IDLE_CLOSE_MIN = {SC_IDLE_CLOSE_MIN} 分钟"
+                    f"（连续这么久零脚本日志就关掉该账号浏览器）")
+        if SC_IDLE_CLOSE_MIN <= STALL_ALERT_MIN:
+            logger.warning(f"⚠️ SC_IDLE_CLOSE_MIN({SC_IDLE_CLOSE_MIN}) ≤ STALL_ALERT_MIN({STALL_ALERT_MIN})："
+                           f"自动修复还没试完就会把浏览器关掉，建议设成 {STALL_ALERT_MIN * 2} 以上")
+    else:
+        logger.info("  SC_IDLE_CLOSE_MIN = 0（未启用零输出止损：报不出完成的账号会挂到收工）")
     logger.info(f"  搜索参数请查看「脚本猫-微软积分商城签到脚本」的 UserConfig 页面配置")
 
     # 单实例保护：若已有同脚本的任务实例在运行，直接退出，避免两个任务
