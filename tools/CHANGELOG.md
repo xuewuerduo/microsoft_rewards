@@ -12,6 +12,64 @@
 
 ---
  
+## v0.86 · 2026-11-23（版本号维护版，补齐更新说明）
+
+**脚本行为与 v0.85 完全一致**。从仓库记录看，这是一次纯版本号递增：
+`microsoft-rewards.user.js` 的正文与 v0.85 逐字节相同（13202 行，忽略 `@version` 行后
+diff 为 0），唯一变化是提交 `5e96499` 把 `@version` 从 0.85 改成 0.86。仓库里没有对应的
+功能改动记录，所以本节只记录版本号与说明文件的补齐，**不虚构任何功能改动**。
+
+### 为什么要补这一节
+
+商店页面当前显示的更新说明是 `$auto-sync$`。这个字符串不是 `tools/sc_sync.py` 生成的
+（它的兜底文案是 `v0.86 更新`），来源仓库里没有记录，不能确定是哪条发版链路写入的。
+但有一件事是确定的：`sc_sync.py` 发版时按 `@version` 依次找
+`release-notes/v0.86.md` → `CHANGELOG.md` 的 `## v0.86` 小节 → 兜底文案，而当时这两个
+文件都不存在，所以线上拿不到一份像样的说明。本次把两处都补齐。
+
+### 改了什么
+
+| 文件 | 改动 |
+|---|---|
+| `microsoft-rewards.user.js` | `@version` 0.85 → 0.86（提交 `5e96499` 已完成，本次未动脚本内容） |
+| `tools/CHANGELOG.md` | 新增本节 |
+| `tools/release-notes/v0.86.md` | 新建商店页面用的精简说明 |
+
+当前脚本指纹：`microsoft-rewards.user.js`，13202 行，MD5 `76d3581b`（前 8 位）。
+v0.85 的 MD5 是 `2dd56467`，差异仅来自 `@version` 那一行；忽略版本行后两份文件完全相同。
+
+### 对跑任务的影响
+
+无。任务逻辑、排程、时段判定、出口检测都和 v0.85 一样，账号下次启动不需要做任何适配。
+
+### 怎么验证改对了
+
+```bash
+cd /data/ssd/WorkSpace/microsoft_rewards
+wc -l microsoft-rewards.user.js && md5sum microsoft-rewards.user.js
+# 期望：13202 行，MD5 以 76d3581b 开头
+
+python tools/sc_sync.py --check
+# 期望：本地 v0.86 ｜ 线上 v0.86（线上说明可能仍是 $auto-sync$，见下）
+
+# 确认脚本正文与 v0.85 只差版本行
+git show 6d5842f:microsoft-rewards.user.js > /tmp/v085.js
+grep -v '^// @version' /tmp/v085.js > /tmp/a.txt
+grep -v '^// @version' microsoft-rewards.user.js > /tmp/b.txt
+diff /tmp/a.txt /tmp/b.txt    # 期望：无输出
+```
+
+**注意**：线上版本已经是 v0.86，本地也是 v0.86。补说明文件本身不会自动改写商店页面，
+`--check` 仍会显示线上说明为 `$auto-sync$`。要让商店页面显示正确的说明，需要带
+`--force` 重推一次（版本相同也推）：
+
+```bash
+python tools/sc_sync.py --push --force --url <webhook地址>
+python tools/sc_sync.py --check   # 确认线上说明已变成新文案
+```
+
+---
+
 ## v0.85 · 2026-11-23（发布链路验证版）
 
 **脚本行为与 v0.84 完全一致**，这次 bump 版本号只为验证一件事：仓库改名 + 目录重排之后，
