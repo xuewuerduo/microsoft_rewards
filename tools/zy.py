@@ -1354,13 +1354,21 @@ def _profile_has_scriptcat(user_dir: str) -> bool:
 
 
 def _extension_load_arg(user_dir: str = None):
-    """返回 --load-extension 参数（逗号分隔的已解包扩展目录）。
-    通用机制：把含 manifest.json 的解压扩展目录放入 EXTENSION_DIRS 中任一目录即自动加载，
-    例如 /app/extensions/scriptcat（已打包脚本猫 ScriptCat）。
-    若 profile 已引用脚本猫解压扩展（模板手动安装/账号克隆自模板自带），则返回 None 跳过，
-    避免与已加载扩展重复加载冲突。无可用扩展时返回 None。"""
-    if user_dir and _profile_has_scriptcat(user_dir):
-        return None
+    """返回 --load-extension 参数（逗号分隔的已解包扩展目录）——【强制加载】。
+
+    Chromium 下加载解包扩展唯一可靠的路径就是启动参数 --load-extension
+    （CDP 的 Extensions.loadUnpacked 只有 Chrome 137+ 支持，容器里的 Chromium 用不了）。
+    其他账号靠这个参数都把脚本猫装上了，所以这里无条件强制传给每个账号，
+    【不再因为 profile 的 Preferences 里有引用就跳过】：
+
+    - 克隆账号（marvin-1）会带上失效的死引用（path 指向不存在的目录），
+      旧逻辑据此跳过 --load-extension，浏览器启动时根本没加载扩展，
+      sc_deploy 又能从 Preferences 读到残留 ID，于是出现"扩展就绪却拿不到扩展页面"的假象。
+    - 对同一扩展目录重复传 --load-extension 是幂等的（扩展 ID 由目录内容决定，保持一致），
+      已装好的账号不会重复加载或报错，4 个正常账号不受影响。
+
+    无可用扩展目录时才返回 None。
+    """
     dirs = []
     # zy.py 同目录下的 scriptcat/ 也允许被 --load-extension 直接加载
     sib = _scriptcat_ext_dir(user_dir)
