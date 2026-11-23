@@ -11,9 +11,11 @@
                        email 用于登录比对
                         例: [{"name":"long","email":"xuewuerduo@hotmail.com"},
                              {"name":"marvin","email":"ldhscu@outlook.com"}]
-可选 BING_RUN_SECONDS  保持运行秒数，供「脚本猫-微软积分商城签到脚本」完成任务
-                          （默认 900=15分钟；0=常驻不自动关闭）
-可选 RUN_WINDOW        运行时段（默认 09:00-15:00；没进时段就不启动浏览器，
+可选 BING_RUN_SECONDS  兜底运行秒数（默认 0=不参与）：正常情况下运行时长由收工时间
+                          决定，这个值只在「RUN_WINDOW 留空 + 没配 RUN_DEADLINE」时生效；
+                          0=常驻，等到全部账号报完成再关
+可选 RUN_WINDOW        运行时段（默认 09:00-23:00，与脚本 Config.winTime 一致；
+                          没进时段就不启动浏览器，
                           避免浏览器空等白占资源）。取值：
                             08:00-11:00            具体时段
                             morning / afternoon / evening / night / allday
@@ -26,8 +28,9 @@
                           v1.0.0 起脚本按自己的 @crontab 每 20 分钟唤醒一次，醒来先看
                           Config.winTime（默认 09:00~23:00）在不在时段内，在就跑一轮。
                           计划文件仍然会写（含开机/收工时刻，便于排查），但新脚本不再读它。
-可选 RUN_DEADLINE      收工时间（默认 18:00）：正常时段内所有任务到此为止，浏览器运行时长由它决定
-                          （配了它就不再按 BING_RUN_SECONDS 计时）；
+可选 RUN_DEADLINE      收工时间（默认取 RUN_WINDOW 末点）：所有任务到此为止，
+                          浏览器运行时长由它决定 —— 运行时长不再看 BING_RUN_SECONDS。
+                          配了就以配的为准（如 21:30）；
                           ★ 启动偏晚时不再死守这条线，见 RUN_LATE_EXTEND
 可选 RUN_START_RANDOM  是否由本脚本在 RUN_WINDOW 内摇开机时刻（默认 1=摇；0=开窗即跑）
 可选 RUN_WINDOW_MISSED 不在时段内时：auto（默认）只要离收工还够 RUN_MIN_SECONDS 就启动
@@ -93,6 +96,11 @@
  可选 BROWSER_MAX_AGE_HOURS    沿用的浏览器「寿命」上限（默认 6 小时；0=不限制）。
                                 超过就关掉重建：跨天/崩溃残留的实例常带着失效的登录态
                                 和被冻结的扩展后台，「进程活着」不等于「还能干活」。
+ 可选 SC_CLOSE_ON_DONE         账号自己任务完成就关它的浏览器（默认 1=开）。
+                                触发点有三个：① 脚本报全天达标（QLREPORT-END）；
+                                ② 脚本报「今日所选任务已全部完成…休眠」；③ 全部账号完成后的收尾。
+                                每个账号独立关闭，全关完主循环立刻结束，不挂到收工时刻。
+                                设 0 = 单账号完成时不立刻关（留到全部完成后的收尾），排查用。
  可选 SC_CLOSE_DELAY           账号报「全部完成」后等多少秒再关浏览器（默认 20；0=立刻关）。
                                 留这 20 秒是为了让脚本把 finish()/状态落盘/「本轮结束」
                                 这条尾巴跑完，否则轮次忙标记会一直停在「忙」。
@@ -223,14 +231,18 @@ RANDOM_DELAY = 0            # 任务开始时随机延迟上限秒数（0=不延
 # ⏰ 运行时段（把「脚本猫」里的时间段配置搬到这里，没进时段就不启动浏览器，省资源）
 # 取值：具体时段 "08:00-11:00"；预设 morning/afternoon/evening/night/allday；
 #       可逗号分隔多段，如 "morning,evening" 或 "08:00-11:00,14:00-17:00"；留空=不限制（一直可跑）
-RUN_WINDOW = os.getenv("RUN_WINDOW", "09:00-15:00").strip()
+# 默认与脚本的 Config.winTime 保持一致（09:00-23:00）：两边不一致时，脚本会在
+# 窗口外打「🌙 当前不在运行时段」空转，而本脚本还在等它干活（2026-11-23 实证）。
+RUN_WINDOW = os.getenv("RUN_WINDOW", "09:00-23:00").strip()
 # 不在时段内时怎么办：
 #   auto（默认）今天还没到窗口 → 等到窗口开始；今天的窗口已经过完 → 直接结束，绝不越过窗口末点
 #   wait        不在窗口内就等到下一段（含跨天），旧行为
 #   skip        不在窗口内就直接结束
 RUN_WINDOW_MISSED = os.getenv("RUN_WINDOW_MISSED", "auto").strip().lower()
 # 收工时间：所有任务到这个点必须结束（关浏览器）。zy.py 按「开机 → 收工」算运行时长。
-RUN_DEADLINE = os.getenv("RUN_DEADLINE", "18:00").strip()
+# 留空（默认）= 取 RUN_WINDOW 最后一段的末点（09:00-23:00 → 23:00）；
+# 想更早收工才需要显式配，如 RUN_DEADLINE=21:00。
+RUN_DEADLINE = os.getenv("RUN_DEADLINE", "").strip()
 # 最短可用运行时长（默认 10800=180 分钟）：开机后至少要给「脚本猫」留这么久，才值得开机。
 # 设为 3 小时而不是 1.5 小时：搜索是每日硬配额（PC 约 50 次、一次 1~2 分钟，合计 1~1.5 小时），
 # 加上阅读/活动卡片，1.5 小时根本压不进去，会在 18:00 被直接截断。
@@ -432,6 +444,10 @@ BROWSER_MAX_AGE_HOURS = float(os.getenv("BROWSER_MAX_AGE_HOURS", "6") or 6)
 # 为什么要等：QLREPORT-END 打在每轮汇总里，紧接着还有 finish()/状态落盘/「本轮结束」
 # 日志；立刻关浏览器会把这段尾巴切掉，还让 zy.py 的轮次忙标记停在「忙」。
 SC_CLOSE_DELAY = int(os.getenv("SC_CLOSE_DELAY", "20") or 20)
+# 账号自己任务完成就关它的浏览器（默认开）。这是「不等到收工」的关键：
+# 每个账号独立关闭，全部关掉后主循环提前结束，不必挂到收工时刻。
+# 设 0 = 单账号完成时不立刻关（留到全部完成后的收尾），排查用。
+SC_CLOSE_ON_DONE = os.getenv("SC_CLOSE_ON_DONE", "1").strip().lower() not in ("0", "false", "no", "off")
 SC_EXT_ID = "ndcooeababalnlpkfedmmbbbgkljhpjf"  # 脚本猫扩展 ID（Chrome 商店安装版）。仅为额外线索，
 #   识别主要靠探测 IndexedDB（不依赖扩展名/ID，扩展猫/改名版同样适用）
 
@@ -915,8 +931,11 @@ def _wait_rounds_idle(timeout: float) -> bool:
         time.sleep(3)
 
 
-def _on_account_done(name, data):
-    """账号任务全部完成：保存进度 → 关闭该浏览器 → 全部完成则汇总通知并停止"""
+def _on_account_done(name, data, reason="任务全部完成"):
+    """账号任务全部完成：保存进度 → 关闭该浏览器 → 全部完成则汇总通知并停止
+
+    reason 只影响日志用词（达标 / 今日无待办休眠），关闭逻辑一致。
+    """
     with _ACCOUNT_LOCK:
         if _ACCOUNT_DONE.get(name):
             return
@@ -927,14 +946,16 @@ def _on_account_done(name, data):
         delay = max(0, SC_CLOSE_DELAY)
 
         def _close_later():
-            logger.info(f"✅ 账号 {name} 任务全部完成，关闭浏览器"
+            logger.info(f"✅ 账号 {name} {reason} → 关闭它的浏览器"
                         + (f"（先等 {delay} 秒让脚本收尾）" if delay else ""))
             try:
                 close_browser(info.get("user_dir"), info.get("port"))
             except Exception as e:
                 logger.debug(f"  关闭 {name} 浏览器异常: {e}")
 
-        if delay:
+        if not SC_CLOSE_ON_DONE:
+            logger.info(f"ℹ️ 账号 {name} {reason}，但 SC_CLOSE_ON_DONE=0 → 暂不关它的浏览器")
+        elif delay:
             # QLREPORT-END 打在每轮汇总里，紧接着还有 finish()/状态落盘/「本轮结束」日志。
             # 立刻关浏览器会把这段尾巴切掉，还会让轮次忙标记永远停在「忙」。
             t = threading.Timer(delay, _close_later)
@@ -1041,7 +1062,7 @@ def _sc_reader(name, port):
                                             continue
                                         # 休眠日志 = 该账号今日任务早已完成、本次只是复检 → 直接关闭浏览器节省资源
                                         if "今日所选任务已全部完成" in line and "休眠" in line:
-                                            _on_account_done(name, None)
+                                            _on_account_done(name, None, reason="今日无待办（休眠）")
                                         ts = lg.get("t") or 0
                                         tt = time.strftime("%H:%M:%S", time.localtime(ts / 1000)) if ts else "--:--:--"
                                         # 空敲门心跳：只拦前台打印，脚印/游标/完成判定都不受影响
@@ -3573,12 +3594,36 @@ def _window_bounds(now: datetime, s: int, e: int):
     return start, end
 
 
+def _window_end_min():
+    """RUN_WINDOW 最后一段的结束分钟（0~1440）；留空/解析不出 → None"""
+    wins = parse_run_windows(RUN_WINDOW)
+    if not wins:
+        return None
+    return max(int(e) for _, e in wins)
+
+
+def _hm(mins: int) -> str:
+    if mins >= 1440:
+        return "24:00"
+    return f"{mins // 60:02d}:{mins % 60:02d}"
+
+
 def _run_deadline(now: datetime):
-    """今天的收工时刻 RUN_DEADLINE（如 18:00）；没配或格式不对返回 None"""
+    """今天的收工时刻：优先 RUN_DEADLINE，没配就用运行时段末点（09:00-23:00 → 23:00）。
+
+    为什么默认改成「时段末点」：以前写死 18:00，而默认时段是 09:00-15:00，
+    两个数字各说各话；日志里「已过运行时段 09:00-15:00，收工时刻 18:00」就是这么来的。
+    现在运行时长一律由收工时间决定（BING_RUN_SECONDS 只在没有时段/收工时兜底）。
+    两者都没有（RUN_WINDOW 留空且没配 RUN_DEADLINE）才返回 None = 不按时间收工。
+    """
     mins = _hhmm_to_min(RUN_DEADLINE)
     if mins is None:
         if RUN_DEADLINE:
             logger.warning(f"⚠️ RUN_DEADLINE={RUN_DEADLINE!r} 格式不对（应形如 18:00），忽略")
+        mins = _window_end_min()
+        if mins is not None:
+            logger.info(f"⏰ 未配 RUN_DEADLINE → 收工时刻取运行时段末点 {_hm(mins)}，运行时长由它决定")
+    if mins is None:
         return None
     base = now.replace(hour=0, minute=0, second=0, microsecond=0)
     dl = base + timedelta(minutes=mins)
@@ -3830,14 +3875,17 @@ def _clamp_run_seconds(run_seconds: int, plan: dict) -> int:
     """运行时长：配了 RUN_DEADLINE 就以「到收工时间」为准；返回 -1 表示已过收工时间"""
     dl = plan.get("deadline")
     if not dl:
+        if run_seconds <= 0:
+            logger.info("⏰ 未配收工时刻（RUN_WINDOW 留空且没配 RUN_DEADLINE）"
+                        "→ 常驻模式：全部账号报完成才结束，不按时间收工")
         return run_seconds
     left = int((dl - datetime.now()).total_seconds())
     if left <= 0:
         logger.warning(f"⏰ 已过收工时间 {dl:%H:%M}，本次不启动浏览器")
         return -1
     if run_seconds != left:
-        logger.info(f"⏰ 运行时长改由收工时间 {dl:%H:%M} 决定：{_fmt_dur(left)}"
-                    f"（原 BING_RUN_SECONDS={run_seconds}）")
+        tail = f"（原 BING_RUN_SECONDS={run_seconds}）" if run_seconds > 0 else ""
+        logger.info(f"⏰ 运行时长由收工时间 {dl:%H:%M} 决定：{_fmt_dur(left)}{tail}")
     return left
 
 
@@ -4054,7 +4102,9 @@ def set_plan_hold(hold: bool, ttl: int = 0):
 
 
 def main():
-    run_seconds = int(get_env("BING_RUN_SECONDS", "900"))
+    # 默认 0 = 不指定时长：正常运行时长由收工时间（RUN_DEADLINE / 时段末点）算出来。
+    # 只有「RUN_WINDOW 留空 + 没配 RUN_DEADLINE」时它才会生效（0=常驻，等全部账号完成）。
+    run_seconds = int(get_env("BING_RUN_SECONDS", "0"))
 
     # 面板停止任务时向进程发送 SIGTERM；若不处理，python 直接退出导致 finally
     # 不执行、浏览器残留。转为 KeyboardInterrupt 走 finally 统一清理。
@@ -4070,7 +4120,13 @@ def main():
     signal.signal(signal.SIGTERM, _on_terminate)
 
     logger.info("⚙️  任务配置:")
-    logger.info(f"  BING_RUN_SECONDS = {run_seconds}（面板环境变量）")
+    _rs_raw = os.getenv("BING_RUN_SECONDS", "")
+    logger.info(f"  BING_RUN_SECONDS = {run_seconds}"
+                f"（{'面板环境变量' if _rs_raw.strip() else '默认'}）"
+                + ("：由收工时间决定实际时长" if run_seconds <= 0 else ""))
+    logger.info(f"  RUN_WINDOW = {RUN_WINDOW or '不限制'}"
+                f"  RUN_DEADLINE = {RUN_DEADLINE or '取时段末点'}"
+                f"  RUN_MIN_SECONDS = {_fmt_dur(RUN_MIN_SECONDS)}")
     logger.info(f"  CLOSE_AFTER = {CLOSE_AFTER}")
     logger.info(f"  CDP_BASE_PORT = {CDP_BASE_PORT}")
     logger.info(f"  HEADLESS_MODE = {HEADLESS_MODE}  DESKTOP_ENABLE = {DESKTOP_ENABLE}")
