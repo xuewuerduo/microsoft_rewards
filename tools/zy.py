@@ -106,6 +106,12 @@
                                 关掉后该账号按「未完成」处理，其余账号照跑；全部收尾后
                                 面板日志会打「🧹 账号 X 已 N 分钟没有任何脚本日志 → 关闭…」。
                                 用来治「报不出完成、一直挂到收工」的账号（5 个就是 5 个常驻 Chromium）。
+ 可选 SC_STUCK_READS           连续多少轮「进度读数完全一样」就判定停滞并关浏览器（默认 3，0=不启用）。
+                                读数取自脚本每轮的汇总日志（达标 x/y、阅读 a/b、PC a/b、总积分 N），
+                                一轮一条，所以 3 轮 ≈ 1 小时没动。
+                                到线时会先在日志里打一遍「📋 任务运行情况」（每个账号跑到哪一步、
+                                最后日志多久前、连续几轮没变），再关该账号的浏览器。
+                                治「日志一直在刷、但一点进展都没有」的账号 —— 按静默时长永远等不到它。
  可选 SC_CLOSE_DELAY           账号报「全部完成」后等多少秒再关浏览器（默认 20；0=立刻关）。
                                 留这 20 秒是为了让脚本把 finish()/状态落盘/「本轮结束」
                                 这条尾巴跑完，否则轮次忙标记会一直停在「忙」。
@@ -459,6 +465,12 @@ SC_CLOSE_ON_DONE = os.getenv("SC_CLOSE_ON_DONE", "1").strip().lower() not in ("0
 #   Cookie 掉登录……）会一直挂到收工 —— 5 个账号就是 5 个常驻 Chromium。
 # 取值要明显大于 STALL_ALERT_MIN（默认 40），否则自动修复还没试完浏览器就被关了。
 SC_IDLE_CLOSE_MIN = int(os.getenv("SC_IDLE_CLOSE_MIN", "0") or 0)
+# 「有声音但一点没进展」的判定：脚本每轮会打一条汇总（达标 x/y、阅读 a/b、PC a/b、总积分 N），
+# 连续这么多轮读数完全一样 → 判定停滞，先打一次运行情况再关浏览器。默认 3 轮（约 1 小时）。
+# 为什么单独一个开关：这类账号日志一直在刷（每 20 分钟一轮），按「静默时长」永远等不到；
+# 但它其实早就不动了（典型：达标 5/7，差的 2 项是锁卡/国际版没下发，永远补不上）。
+# 设 0 = 只按静默时长止损，不按进度判停滞。
+SC_STUCK_READS = int(os.getenv("SC_STUCK_READS", "3") or 0)
 SC_EXT_ID = "ndcooeababalnlpkfedmmbbbgkljhpjf"  # 脚本猫扩展 ID（Chrome 商店安装版）。仅为额外线索，
 #   识别主要靠探测 IndexedDB（不依赖扩展名/ID，扩展猫/改名版同样适用）
 
@@ -1009,6 +1021,164 @@ def _on_account_done(name, data, reason="任务全部完成", ok=True):
         _ALL_DONE.set()
 
 
+# ==============================================
+# 📈 每轮进度读数：判断「跑着但没动」用
+# ==============================================
+# 脚本每轮结束会打一条汇总（非达标时走 Utils.log("📊", …)）：
+#   本轮结果 · 还差 2 项 ↵ 📋 阅读 · ⏳ 12/30 ↵ 🔍 PC 搜索 · ⏳ 18/30
+#   ↵ 💰 今日获取 +45 · 总积分 4098 ↵ ✅ 达标 5/7 · ⏱️ 用时 320 秒
+# 这几个数字就是最可靠的「进度指纹」：变了说明还在干活，连续几轮不变说明卡住了。
+_RE_PC = re.compile(r"PC\s*搜索[^0-9]*(\d+)\s*/\s*(\d+)")
+_RE_MOB = re.compile(r"手机搜索[^0-9]*(\d+)\s*/\s*(\d+)")
+_RE_READ = re.compile(r"阅读[^0-9]*(\d+)\s*/\s*(\d+)")
+_RE_GOAL = re.compile(r"达标\s*(\d+)\s*/\s*(\d+)")
+_RE_TOTAL = re.compile(r"总积分\s*(\d+)")
+_RE_GAIN = re.compile(r"今日获取\s*\+\s*(\d+)")
+_RE_LEFT = re.compile(r"还差\s*(\d+)\s*项")
+
+_PROGRESS = {}   # name -> {"sig": tuple, "same": int, "at": ts, "text": str}
+
+
+def _parse_round_progress(line):
+    """从一条日志里抠本轮进度；不是「本轮汇总」就返回 None。
+
+    只认同时带「达标 x/y」或「总积分 N」的行，避免把零散日志当读数
+    （否则一轮里多条日志会让「连续几轮没变」的计数失真）。
+    """
+    if not line or ("达标" not in line and "总积分" not in line):
+        return None
+    vals, bits = {}, []
+    m = _RE_GOAL.search(line)
+    if m:
+        vals["goal"] = (int(m.group(1)), int(m.group(2)))
+        bits.append(f"达标 {m.group(1)}/{m.group(2)}")
+    m = _RE_READ.search(line)
+    if m:
+        vals["read"] = (int(m.group(1)), int(m.group(2)))
+        bits.append(f"阅读 {m.group(1)}/{m.group(2)}")
+    m = _RE_PC.search(line)
+    if m:
+        vals["pc"] = (int(m.group(1)), int(m.group(2)))
+        bits.append(f"PC {m.group(1)}/{m.group(2)}")
+    m = _RE_MOB.search(line)
+    if m:
+        vals["mob"] = (int(m.group(1)), int(m.group(2)))
+        bits.append(f"手机 {m.group(1)}/{m.group(2)}")
+    m = _RE_TOTAL.search(line)
+    if m:
+        vals["total"] = int(m.group(1))
+        bits.append(f"总积分 {m.group(1)}")
+    m = _RE_GAIN.search(line)
+    if m:
+        vals["gain"] = int(m.group(1))
+        bits.append(f"今日 +{m.group(1)}")
+    m = _RE_LEFT.search(line)
+    if m:
+        bits.append(f"还差 {m.group(1)} 项")
+    if "goal" not in vals and "total" not in vals:
+        return None
+    sig = tuple(sorted(vals.items()))
+    return {"sig": sig, "text": " · ".join(bits)}
+
+
+def _note_progress(name, line):
+    """记一条进度读数；同一条汇总连续几次一样就提示 / 判定停滞。
+
+    只在「读完一轮汇总」时被调用（见 _sc_reader 的日志循环）。
+    """
+    parsed = _parse_round_progress(line)
+    if not parsed:
+        return
+    now = time.time()
+    with _NORUN_LOCK:
+        if _ACCOUNT_DONE.get(name):
+            return
+        ent = _PROGRESS.get(name) or {}
+        same = int(ent.get("same") or 0)
+        same = same + 1 if ent.get("sig") == parsed["sig"] else 0
+        _PROGRESS[name] = {"sig": parsed["sig"], "same": same,
+                           "at": now, "text": parsed["text"]}
+        text = parsed["text"]
+    rounds = same + 1          # 含当前这一轮：连续 rounds 轮读数相同
+
+    if rounds <= 1:
+        return
+    need = SC_STUCK_READS
+    if need <= 0:
+        # 关掉了「按进度判停滞」：连提示也不打，免得每轮刷一行
+        return
+    if rounds < need:
+        # 还没到判定线：给个提示，别刷屏（只在新的一轮「又没变」时打一行）
+        logger.info(f"⏳ 账号 {name} 连续 {rounds} 轮进度没变化（{text}）"
+                    f"，再连续 {need - rounds} 轮仍无进展就判定停滞")
+        return
+
+    # 到线：先把运行情况打出来（关掉浏览器后就再没有日志了，这是事后排查的线索），
+    # 再给一句结论，最后关浏览器。
+    logger.warning(f"⚠️ 账号 {name} 连续 {rounds} 轮进度没变化（{text}）"
+                   f"→ 判定停滞（阈值 {need} 轮）")
+    _print_run_status(focus=name, why=f"{name} 连续 {rounds} 轮进度没变化")
+    send(f"【账号止损】{name} 进度停滞",
+         f"账号 {name} 连续 {rounds} 轮读数完全一样，已判定停滞并关闭浏览器：\n{text}\n\n"
+         f"常见原因：剩下的任务补不上（锁卡 / 国际版没下发 hash / 桌面任务缺 Chrome），"
+         f"脚本每轮都在重复查同一份结果。\n"
+         f"其余账号继续跑；排查完想让它在下一轮恢复：面板重新跑一次任务即可。")
+    _on_account_done(name, None, ok=False, reason=f"连续 {rounds} 轮进度没变化（停滞）")
+
+
+def _print_run_status(focus=None, why=""):
+    """打印一次「任务运行情况」总览：每个账号的进度、最后日志、连续无变化轮数。
+
+    关闭浏览器前调用。关掉之后这个账号就再也不会出现在日志里了，
+    所以这几行是事后判断「它到底干到哪一步」的唯一依据。
+    """
+    now = time.time()
+    focus = focus or ()
+    if isinstance(focus, str):
+        focus = (focus,)
+    focus = set(focus)
+    with _ACCOUNT_LOCK:
+        names = list(_ACCOUNT_BROWSERS.keys())
+        done = dict(_ACCOUNT_DONE)
+        failed = set(_ACCOUNT_FAILED)
+    with _NORUN_LOCK:
+        prog = {n: dict(v) for n, v in _PROGRESS.items()}
+        last = dict(_LAST_LOG_TS)
+        watch = dict(_WATCH_START)
+    started = min(watch.values()) if watch else 0
+    head = "📋 任务运行情况"
+    if started:
+        head += f"（已跑 {_fmt_dur(now - started)}）"
+    if why:
+        head += f" · 触发原因：{why}"
+    logger.info(head)
+    if not names:
+        logger.info("   （没有登记在册的浏览器）")
+        return
+    for n in names:
+        bits = []
+        if n in failed:
+            bits.append("⚠️ 已止损")
+        elif done.get(n):
+            bits.append("✅ 已完成")
+        else:
+            bits.append("进行中")
+        ent = prog.get(n) or {}
+        if ent.get("text"):
+            bits.append(ent["text"])
+            if ent.get("same"):
+                bits.append(f"连续 {int(ent['same']) + 1} 轮无变化")
+        ts = last.get(n)
+        if ts:
+            bits.append(f"最后日志 {int((now - ts) / 60)} 分钟前")
+        elif watch.get(n):
+            bits.append(f"从未有日志（启动 {int((now - watch[n]) / 60)} 分钟）")
+        line = f"   {'▶' if n in focus else ' '} {n:<10} " + " · ".join(bits)
+        if n in focus:
+            line += "   ← 本次关闭"
+        logger.info(line)
+
+
 def _sc_reader(name, port):
     """轮询读取脚本猫/扩展猫 IndexedDB 日志（=扩展「运行日志」同一数据源），
     仅打印日志内容（精简），错误日志额外发送通知"""
@@ -1094,6 +1264,11 @@ def _sc_reader(name, port):
                                         # 休眠日志 = 该账号今日任务早已完成、本次只是复检 → 直接关闭浏览器节省资源
                                         if "今日所选任务已全部完成" in line and "休眠" in line:
                                             _on_account_done(name, None, reason="今日无待办（休眠）")
+                                        # 每轮汇总里的数字变化 → 判断「跑着但一点没进展」
+                                        try:
+                                            _note_progress(name, line)
+                                        except Exception:
+                                            pass
                                         ts = lg.get("t") or 0
                                         tt = time.strftime("%H:%M:%S", time.localtime(ts / 1000)) if ts else "--:--:--"
                                         # 空敲门心跳：只拦前台打印，脚印/游标/完成判定都不受影响
@@ -1218,6 +1393,7 @@ def _no_run_watch():
         #   为什么放在 ② 之前：② 是「先试着救」（reload 扩展），救了两轮还不出声，
         #   再占着内存就没意义了。只有 SC_IDLE_CLOSE_MIN>0 时才启用。
         if SC_IDLE_CLOSE_MIN > 0:
+            victims = []
             for n in names:
                 if n in done or _ACCOUNT_DONE.get(n) or n not in ports:
                     continue
@@ -1225,7 +1401,12 @@ def _no_run_watch():
                 ref = last_ts.get(n) or starts.get(n)
                 if not ref or (now - ref) < SC_IDLE_CLOSE_MIN * 60:
                     continue
-                silent = int((now - ref) / 60)
+                victims.append((n, int((now - ref) / 60)))
+            if victims:
+                # 关掉之后这些账号就再没有日志了：先把所有账号跑到哪一步打一遍（一次，不按账号重复）
+                _print_run_status(focus=[n for n, _ in victims],
+                                  why="、".join(f"{n} 已静默 {s} 分钟" for n, s in victims))
+            for n, silent in victims:
                 logger.warning(f"🧹 账号 {n} 已 {silent} 分钟没有任何脚本日志"
                                f"（阈值 {SC_IDLE_CLOSE_MIN} 分钟）→ 关闭它的浏览器省资源"
                                f"（今天该账号的任务算放弃，其余账号不受影响）")
@@ -4672,6 +4853,13 @@ def main():
     except Exception as e:
         logger.error(f"❌ 任务出错: {e}", exc_info=True)
     finally:
+        # 收尾前把每个账号干到哪一步打一遍：关掉浏览器后日志就归零了，
+        # 这几行是事后回答「今天到底缺哪一步」的唯一依据。
+        if _ACCOUNT_BROWSERS:
+            try:
+                _print_run_status(why="任务结束")
+            except Exception:
+                pass
         if CLOSE_AFTER or _TERMINATED:
             logger.info("🚪 任务结束，正在关闭全部浏览器...")
             for name, user_dir, pid, port, result in browsers:
