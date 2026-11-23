@@ -5,10 +5,10 @@
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；任务逻辑取自 #8787 v1.5.9，另加多账号 CDP 端口认领、zy.py 日志转发、中文热搜词池
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
-// @homepage     https://scriptcat.org/script-show-page/8787
-// @homepageURL  https://scriptcat.org/script-show-page/8787
-// @website      https://scriptcat.org/script-show-page/8787
-// @supportURL   https://scriptcat.org/script-show-page/8787/issue/create
+// @homepage     https://scriptcat.org/zh-CN/script-show-page/6006
+// @homepageURL  https://scriptcat.org/zh-CN/script-show-page/6006
+// @website      https://scriptcat.org/zh-CN/script-show-page/6006
+// @supportURL   https://scriptcat.org/zh-CN/script-show-page/6006/issue/create
 // @source       https://github.com/hidmould/MicrosoftPoints
 // @crontab      */20 * * * *
 // @connect      bing.com
