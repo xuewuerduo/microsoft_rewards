@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      0.89
+// @version      0.90
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；已适配 zy 版逻辑（每日随机排程、中文热搜、llq.py 上报、多账号 CDP 端口）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -11890,6 +11890,31 @@ const __scBgKeepAlive = (function() {
                     lo + RANDOM_WAKE.MIN_POINTS * RANDOM_WAKE.MIN_GAP + RANDOM_WAKE.ROUND_TAIL));
             }
 
+            /* ③ 之前先判「时间还够不够撒点」——不够就别撒，直接一轮接一轮做。
+               典型形态（2026-11-23 实跑）：17:15 开机、计划收工 20:17，但执行点不排
+               18:00 后 → 可用区间只剩 45 分钟。这时撒点只能撒出 1 个随机点（如 17:52），
+               明明有时间却干等半小时才开跑，纯亏。
+               判定用「一个完整间隔 + 前后余量」（70+10+20=100 分钟）：连一个点都放不踏实
+               就不排点，改走 18 点后那套「一轮接一轮」的连续模式
+               （节拍与 yh.js 的 20 分钟定时一致）。时间够（如 09:00 开机、区间 8 小时）
+               则一切照旧，正常撒点。 */
+            const minSpanMin = RANDOM_WAKE.MIN_GAP + RANDOM_WAKE.EDGE_PAD + RANDOM_WAKE.ROUND_TAIL;
+            if (hi - lo < minSpanMin) {
+                /* 一天只打一条：todayPlan 每分钟都会被敲门调到，不限流会刷屏。 */
+                try {
+                    if ((Number(GM_getValue("Config.contLateDate", 0)) || 0) !== date) {
+                        GM_setValue("Config.contLateDate", date);
+                        Utils.log("🚀", `可用区间只剩 ${Math.max(0, Math.round(hi - lo))} 分钟`
+                            + `（不足 ${minSpanMin} 分钟，撒点等于白等）→ 今天不排执行点，`
+                            + "直接一轮接一轮做到收工");
+                    }
+                } catch (_) {}
+                return {
+                    v: this.PLAN_VER, date, mode: "continuous", name: "时间不够→连续跑",
+                    points: [], used: [], rangeKey: `continuous-late|${date}`
+                };
+            }
+
             /* ③ 撒点：对齐引擎真正可信的唤醒节拍（SCHED_GRID 分钟）。
                   这一条是从实跑日志反推出来的：@crontab 在本环境里被退避到 20 分钟一次
                   （14:40:42 → 15:00:42），真正准点叫醒的只有「定时执行」的整 10 分钟
@@ -11977,6 +12002,20 @@ const __scBgKeepAlive = (function() {
             const d = new Date(now);
             const curMin = d.getHours() * 60 + d.getMinutes();
             const p = this.todayPlan(now);
+            /* 「时间不够撒点」→ 连续模式（见 todayPlan 里那一判）：不等执行点，
+               按 yh.js 那套 20 分钟节拍一轮接一轮。和下面 18 点后那段同一道闸门，
+               只是不必等到 18 点 —— 晚启动时干等一个随机点才是最亏的。
+               18 点后仍走下面的分支（它带「头 3 分钟等校准」的额外保护）。 */
+            if (p.mode === "continuous" && curMin < PLAN_CUTOFF_MIN) {
+                const lastEndC = Number(GM_getValue(ROUND_END_KEY, 0)) || 0;
+                if (lastEndC > 0 && now >= lastEndC && (now - lastEndC) < AFTER18_IDLE_MS) {
+                    return {
+                        hit: false, plan: p, waitIdle: true,
+                        idleLeftMs: AFTER18_IDLE_MS - (now - lastEndC)
+                    };
+                }
+                return { hit: true, point: curMin, index: -1, plan: p, leadMs: 0, continuous: true };
+            }
             /* 18 点后不看执行点：每次敲门都算命中（上一轮还在跑时由 ⑦ 让路），
                于是一轮接一轮做到今天做完为止。这就是「18 点后按默认连续做」。
                但 18 点后的**头 3 分钟**先不跑：计划只排到 18:00，脚本读不到 hold 标记
@@ -12450,16 +12489,20 @@ const __scBgKeepAlive = (function() {
                正好撞上 zy.py 的装扩展/校准。 */
             if (peek.waitCalib) return { ran: false, reason: "waitCalib" };
 
-            /* ⑥a0'' 18 点后节拍未到（距上一轮结束不满 20 分钟）：静默等。
-               不能再往下面的分支走 —— 那里是 18 点前「未命中执行点」的话术，
-               18 点后没有执行点，打出来会是「下一执行点 今日已跑完」，误导人。 */
+            /* ⑥a0'' 连续模式节拍未到（距上一轮结束不满 20 分钟）：静默等。
+               18 点后和「时间不够→连续跑」共用这一段；后者发生在前，日志话术要分开，
+               否则 17:30 打出「18 点后节拍未到」会让人以为时间判断错了。
+               也不能往下面的分支走 —— 那里是「未命中执行点」的话术，
+               连续模式没有执行点，会打出「下一执行点 今日已跑完」，同样误导人。 */
             if (peek.waitIdle) {
                 const leftMs = Math.max(0, Number(peek.idleLeftMs) || 0);
                 if (!this.isBusy(now)) this.state("waiting", { runAt: now + leftMs, byPlan: true });
                 const quietAt = Number(GM_getValue("Config.after18IdleLogAt", 0)) || 0;
                 if (now - quietAt >= 10 * 60 * 1000) {
                     GM_setValue("Config.after18IdleLogAt", now);
-                    Utils.log("💤", `18 点后节拍未到：上一轮结束才 `
+                    const why = (peek.plan && peek.plan.mode === "continuous"
+                        && peek.plan.name !== "18 点后连续") ? "连续模式节拍未到" : "18 点后节拍未到";
+                    Utils.log("💤", `${why}：上一轮结束才 `
                         + `${Math.max(0, Math.round((AFTER18_IDLE_MS - leftMs) / 60000))} 分钟，`
                         + `${Math.max(1, Math.ceil(leftMs / 60000))} 分钟后再开一轮（20 分钟一次）`);
                 }
