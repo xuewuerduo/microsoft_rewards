@@ -447,17 +447,48 @@ def detect_ext_id(port, log=None):
     return None
 
 
-def resolve_ext_id(port, ext_dir=None, user_dir=None, log=None, guess=True):
-    """按可靠性顺序认扩展 ID：Preferences → chrome://extensions → 路径哈希。
+def _runtime_has_ext(port, ext_id, log=None):
+    """用 developerPrivate 确认 ext_id 在浏览器运行时真的存在。
 
-    guess=False 时不做「路径哈希」这种猜测——猜测出来的 ID 在扩展没加载时会让
-    调用方误以为扩展已就绪，从而跳过 loadUnpacked 安装。
+    克隆 profile 的 Preferences 会残留脚本猫 ID，但扩展文件没跟过来/被禁用，
+    运行时其实没有这个扩展；直接信 Preferences 会造成「假就绪」并跳过 loadUnpacked。
+    detect_ext_id 已经打开 chrome://extensions 页面，这里复用它。
     """
-    eid = ext_id_from_prefs(user_dir)
-    if eid:
-        return eid
+    log = log or (lambda *a, **k: None)
+    try:
+        for t in list_targets(port):
+            if (t.get("url") or "").startswith("chrome://extensions") and t.get("webSocketDebuggerUrl"):
+                sess = _CdpSession(t["webSocketDebuggerUrl"])
+                try:
+                    js = ("(function(){return new Promise(function(res){"
+                          "try{chrome.developerPrivate.getExtensionsInfo({includeDisabled:true},function(l){"
+                          "res(JSON.stringify((l||[]).some(function(e){return e.id===%s;})));"
+                          "});}catch(e){res('false');}});})()" % json.dumps(str(ext_id)))
+                    raw = sess.evaluate(js, timeout=15)
+                    try:
+                        return bool(json.loads(raw)) if isinstance(raw, str) else bool(raw)
+                    except Exception:
+                        return str(raw).strip().strip('"').lower() == "true"
+                finally:
+                    sess.close()
+    except Exception as e:
+        log("    [!] 校验扩展运行时存在性失败: %s" % e)
+    return False
+
+
+def resolve_ext_id(port, ext_dir=None, user_dir=None, log=None, guess=True):
+    """按可靠性顺序认扩展 ID：运行时 → Preferences → 路径哈希。
+
+    运行时（chrome://extensions）优先是关键：克隆 profile 的 Preferences 会残留
+    脚本猫 ID 但扩展没真正加载，若以它为准就会「假就绪」、跳过 loadUnpacked，
+    后续「允许用户脚本 / 扩展页面」全失败（marvin-1 新账号即此症状）。
+    guess=False 时不做「路径哈希」猜测，避免猜对 ID 却没加载的假成功。
+    """
     eid = detect_ext_id(port, log=log)
     if eid:
+        return eid
+    eid = ext_id_from_prefs(user_dir)
+    if eid and _runtime_has_ext(port, eid, log=log):
         return eid
     return ext_id_from_path(ext_dir) if guess else None
 

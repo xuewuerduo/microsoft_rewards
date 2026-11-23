@@ -1322,8 +1322,16 @@ EXTENSION_DIRS = ("/app/extensions", "/data/extensions")
 
 
 def _profile_has_scriptcat(user_dir: str) -> bool:
-    """profile 的 Preferences 是否已引用脚本猫解压扩展（path 指向 scriptcat 目录）。
-    模板 _template 手动安装脚本猫后，新账号克隆自模板即自带该引用，无需再 --load-extension。"""
+    """profile 的 Preferences 是否【真实引用且已加载】脚本猫解压扩展。
+
+    模板 _template 手动装过脚本猫，新账号克隆自模板会带上引用；但克隆过来的
+    Preferences 里那条 path 可能指向模板当时的目录/已经失效——此时如果仅凭
+    字符串引用就返回 True，_extension_load_arg 会跳过 --load-extension，浏览器
+    启动时根本没加载扩展，而 sc_deploy 又能从 Preferences 读到残留 ID 误判"就绪"，
+    于是出现 marvin-1 那种"扩展就绪却拿不到扩展页面"的假象。
+
+    因此必须校验 path 指向的目录真实存在，才算扩展有效、才能跳过 --load-extension。
+    """
     try:
         prefs = os.path.join(user_dir, "Default", "Preferences")
         if not os.path.exists(prefs):
@@ -1331,10 +1339,16 @@ def _profile_has_scriptcat(user_dir: str) -> bool:
         with open(prefs, "r", encoding="utf-8") as f:
             d = json.load(f)
         settings = d.get("extensions", {}).get("settings", {})
-        return any(
-            isinstance(v, dict) and str(v.get("path", "")).rstrip("/").endswith("scriptcat")
-            for v in settings.values()
-        )
+        for v in settings.values():
+            if not isinstance(v, dict):
+                continue
+            p = str(v.get("path", "")).rstrip("/")
+            if not p.endswith("scriptcat"):
+                continue
+            # 关键：引用指向的扩展目录必须真实存在，否则是克隆残留的死引用
+            if os.path.isdir(p):
+                return True
+        return False
     except Exception:
         return False
 
