@@ -22,8 +22,10 @@
                           留空=不限制（一直可跑）
                         分工：朱雀面板的 Cron 表达式写 `0 0 9 * * *`（每天 9:00 拉起一次），
                           开机时刻由本脚本在 RUN_WINDOW 内随机挑（到点才启动浏览器，
-                          等待期间只占一个空闲进程）。真正的签到执行时刻由「脚本猫」
-                          读计划文件后在 [开机时刻, RUN_DEADLINE] 之间二次随机。
+                          等待期间只占一个空闲进程）。真正的签到执行时刻归「脚本猫」：
+                          v1.0.0 起脚本按自己的 @crontab 每 20 分钟唤醒一次，醒来先看
+                          Config.winTime（默认 09:00~23:00）在不在时段内，在就跑一轮。
+                          计划文件仍然会写（含开机/收工时刻，便于排查），但新脚本不再读它。
 可选 RUN_DEADLINE      收工时间（默认 18:00）：正常时段内所有任务到此为止，浏览器运行时长由它决定
                           （配了它就不再按 BING_RUN_SECONDS 计时）；
                           ★ 启动偏晚时不再死守这条线，见 RUN_LATE_EXTEND
@@ -84,8 +86,16 @@
  可选 SC_EXT_PREP_MIN_GAP      启动预检与开跑前复核的最小间隔秒数（默认 300；
                                 间隔内直接复用启动时的结果，不重查 GitHub、不重下包）
  可选 SC_CALIB_WAIT_SEC        已废弃（保留只为兼容旧配置）：v0.81 起不再等「首轮心跳」，
-                                四个账号部署完就校准；比对是只读的，reload 由计划里的
-                                hold（暂缓开跑）保护
+                                四个账号部署完就校准；比对是只读的。
+                                ⚠️ v1.0.0 起脚本不再读计划里的 hold（暂缓开跑），校准期间
+                                「不会抢先开跑」这条保证已不存在；改为先看脚本自己的
+                                「本轮进入执行流程/本轮结束」日志判轮次空窗，最多等 60 秒。
+ 可选 BROWSER_MAX_AGE_HOURS    沿用的浏览器「寿命」上限（默认 6 小时；0=不限制）。
+                                超过就关掉重建：跨天/崩溃残留的实例常带着失效的登录态
+                                和被冻结的扩展后台，「进程活着」不等于「还能干活」。
+ 可选 SC_CLOSE_DELAY           账号报「全部完成」后等多少秒再关浏览器（默认 20；0=立刻关）。
+                                留这 20 秒是为了让脚本把 finish()/状态落盘/「本轮结束」
+                                这条尾巴跑完，否则轮次忙标记会一直停在「忙」。
 
   扩展更新走两段式（v0.82 起）：
     ① 进程一启动：直接去 GitHub（走加速站）取最新脚本猫扩展，解包到本地固定目录
@@ -385,7 +395,8 @@ SC_LOG_POLL = 30            # 轮询间隔（秒）；设置过小会导致刷�
 # now=只输出采集器挂载之后的新日志（旧行为，可能漏掉部署慢账号的首次计划日志）。
 # （朱雀面板「环境变量」页添加 SC_LOG_BASELINE=now / all 可覆盖）
 SC_LOG_BASELINE = os.getenv("SC_LOG_BASELINE", "all").lower()
-# 前台隐藏「每分钟一条 exec script complete」空敲门日志：无信息量、纯刷屏。
+# 前台隐藏「每次唤醒一条 exec script complete」空敲门日志：无信息量、纯刷屏
+# （v1.0.0 起是每 20 分钟一条，仍属噪声）。
 # 只影响 print，不影响日志采集、脚本脚印判定、任务完成判定（那些都在打印点之前）。
 # 想恢复显示：面板环境变量里设 SC_HIDE_HEARTBEAT=0
 SC_HIDE_HEARTBEAT = os.getenv("SC_HIDE_HEARTBEAT", "1").lower() in ("1", "true", "yes", "on")
@@ -395,7 +406,25 @@ _SCRIPT_START_TS = int(time.time() * 1000)   # 脚本运行开始时刻（baseli
 # 心跳本身由 xf.js 每轮结束发 [QLREPORT-MSG]（zy.py 按账号名发通知）；这里是它的兜底——
 # 脚本根本没运行时连心跳都发不出，只能由日志采集侧发现「零脚印」。
 ALERT_NO_RUN = os.getenv("ALERT_NO_RUN", "1") in ("1", "true", "yes", "on")
-NO_RUN_GRACE_MIN = int(os.getenv("NO_RUN_GRACE_MIN", "40"))  # 宽限期（分钟）：浏览器启动后多久还没任何脚本日志就告警
+# 宽限期（分钟）：浏览器启动后多久还没任何脚本日志就告警。
+# 为什么是 40：v1.0.0 起脚本按 @crontab 每 20 分钟唤醒一次，浏览器起来后第一轮
+# 最多要等 20 分钟，再叠加轮内错峰 0~5 分钟，静默上限约 25 分钟 —— 宽限期必须大于它，
+# 否则每个账号第一轮都会误报「脚本未运行」。
+NO_RUN_GRACE_MIN = int(os.getenv("NO_RUN_GRACE_MIN", "40"))
+# 脚本「跑到一半停摆」阈值（分钟）。同样按 20 分钟节拍定：一轮跑满 20 分钟后
+# 到下一轮开跑之间，正常情况下最长静默 ≈ 20 分钟（等 cron）+ 5 分钟（错峰）。
+# 原来 25 分钟是按「每分钟敲门」时代定的，换节拍后会把正常的轮间空窗判成停摆，
+# 触发没必要的修复（reload 扩展会把正在跑的那一轮掐断），所以抬到 40。
+STALL_ALERT_MIN = int(os.getenv("STALL_ALERT_MIN", "40"))
+# 复用前校验：浏览器连续运行超过这么多小时就关掉重起。
+# 为什么要有：跨天/上次崩溃残留的浏览器会被「已在运行，沿用」，可它的登录态、
+# 扩展后台、cron 挂载都可能已经烂掉（线上 joe 就是沿用了一个陈旧实例，脚本认领
+# 到端口却读不到登录态，整轮白跑）。与其猜它还能不能用，不如过了寿命就重建。
+BROWSER_MAX_AGE_HOURS = float(os.getenv("BROWSER_MAX_AGE_HOURS", "6") or 6)
+# 脚本报「全部完成」后，等这么多秒再关该账号浏览器。
+# 为什么要等：QLREPORT-END 打在每轮汇总里，紧接着还有 finish()/状态落盘/「本轮结束」
+# 日志；立刻关浏览器会把这段尾巴切掉，还让 zy.py 的轮次忙标记停在「忙」。
+SC_CLOSE_DELAY = int(os.getenv("SC_CLOSE_DELAY", "20") or 20)
 SC_EXT_ID = "ndcooeababalnlpkfedmmbbbgkljhpjf"  # 脚本猫扩展 ID（Chrome 商店安装版）。仅为额外线索，
 #   识别主要靠探测 IndexedDB（不依赖扩展名/ID，扩展猫/改名版同样适用）
 
@@ -834,7 +863,7 @@ _NORUN_LOCK = threading.Lock()
 _ROUND_BUSY = {}
 
 # 脚本「跑到一半彻底停摆」判定：某账号最近一条脚本日志已经过去多少分钟
-STALL_ALERT_MIN = int(os.getenv("STALL_ALERT_MIN", "25"))
+# （STALL_ALERT_MIN 统一在文件上方常量区定义，默认 40，按 v1.0.0 的 20 分钟节拍定）
 # 停摆后是否尝试自动修复（重新确认脚本已启用 → 必要时 reload 扩展），默认开
 SC_STALL_REPAIR = os.getenv("SC_STALL_REPAIR", "1") in ("1", "true", "yes", "on")
 # 同一账号两次停摆告警/修复之间的最小间隔（分钟），避免把 CDP 打爆
@@ -888,8 +917,24 @@ def _on_account_done(name, data):
         _ACCOUNT_END_DATA[name] = data
         info = _ACCOUNT_BROWSERS.get(name)
     if info and (info.get("port") or info.get("pid")):
-        logger.info(f"✅ 账号 {name} 任务全部完成，关闭浏览器")
-        close_browser(info.get("user_dir"), info.get("port"))
+        delay = max(0, SC_CLOSE_DELAY)
+
+        def _close_later():
+            logger.info(f"✅ 账号 {name} 任务全部完成，关闭浏览器"
+                        + (f"（先等 {delay} 秒让脚本收尾）" if delay else ""))
+            try:
+                close_browser(info.get("user_dir"), info.get("port"))
+            except Exception as e:
+                logger.debug(f"  关闭 {name} 浏览器异常: {e}")
+
+        if delay:
+            # QLREPORT-END 打在每轮汇总里，紧接着还有 finish()/状态落盘/「本轮结束」日志。
+            # 立刻关浏览器会把这段尾巴切掉，还会让轮次忙标记永远停在「忙」。
+            t = threading.Timer(delay, _close_later)
+            t.daemon = True
+            t.start()
+        else:
+            _close_later()
     if data is None:
         # 休眠场景（任务早已完成、本次只是复检）→ 关闭浏览器并通知，节省资源
         send("【账号完成】", f"✅ 账号 {name} 今日任务已完成，浏览器已关闭（休眠节省资源）。")
@@ -1138,7 +1183,7 @@ def _no_run_watch():
                 logger.info(f"  ✅ 账号 {n} 修复完成：{detail}")
                 send(f"【告警】账号 {n} 脚本停摆已尝试修复",
                      f"账号 {n} 最近 {silent_min} 分钟没有脚本日志，已自动处理：\n{detail}\n"
-                     f"请留意后续是否恢复敲门（每分钟一行 exec script complete）。")
+                     f"请留意后续是否恢复敲门（正常情况下每 20 分钟至少一轮任务日志）。")
             else:
                 logger.warning(f"  ⚠️ 账号 {n} 自动修复未成功：{detail}")
                 send(f"【告警】账号 {n} 脚本停摆",
@@ -1204,6 +1249,30 @@ def get_running_pid(user_dir: str):
     """返回使用该用户目录的浏览器主进程 PID（精确匹配 profile 路径，无则 None）。"""
     pids = _pids_for_user_dir(user_dir)
     return min(pids) if pids else None
+
+
+def _proc_age_sec(pid: int):
+    """该进程已经运行了多少秒（读 /proc/<pid>/stat 的 starttime 换算），取不到返回 None。
+
+    为什么不用 psutil：容器里只有标准库，读 /proc 两个文件就够。
+    starttime = 自开机以来的时钟滴答数，除以 CLK_TCK 再和 /proc/uptime 相减即年龄。
+    也不用 profile 目录 mtime —— 浏览器一直在写 profile，mtime 永远是「刚刚」。
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            raw = f.read().decode("utf-8", "replace")
+        # comm 里可能带空格和括号，从最后一个 ')' 之后再切，字段才不会错位
+        rest = raw[raw.rfind(")") + 2:].split()
+        start_ticks = float(rest[19])          # 第 22 个字段（跳过 pid/comm/state 后索引 19）
+        with open("/proc/uptime", "r") as f:
+            uptime = float(f.read().split()[0])
+        try:
+            hz = float(os.sysconf("SC_CLK_TCK") or 100)
+        except Exception:
+            hz = 100.0
+        return max(0.0, uptime - start_ticks / hz)
+    except Exception:
+        return None
 
 
 def _browser_argv(pid: int) -> list:
@@ -1829,10 +1898,12 @@ def _pre_task_calibrate(browsers, plan=None, max_wait=None):
          本地固定目录里已经是最新版；
       ② 四个账号浏览器起来后，这里逐个比「已装版本 vs 本地目录版本」，不一致就
          reload（同路径同 ID，脚本与 Cookie 授权都保留，不重启浏览器、不重开 profile）；
-      ③ 扩展一致后继续校准用户脚本版本；全部做完才解除计划 hold，任务才真正开始。
+      ③ 扩展一致后继续校准用户脚本版本。
     所以这里既不查 GitHub、也不下 5MB 包 —— 4 个账号只剩「读版本 + 可能 reload」。
-    计划里的 hold 保证脚本在校准期间不会抢先开跑，因此不再等「脚本猫首轮心跳」；
-    仍留一小段 _wait_rounds_idle，兜住「沿用上一轮浏览器、里面正有一轮在跑」的情况。
+    ⚠️ v1.0.0 起脚本按自己的 @crontab 每 20 分钟唤醒，**不再读计划里的 hold**，
+       「校准期间脚本不会抢先开跑」这条保证已经不存在；改成看脚本的
+       「本轮进入执行流程 / 本轮结束」日志判断轮次空窗，最多等 60 秒，
+       等不到就照做（最多掐断一轮，20 分钟后 cron 自然重来，任务幂等）。
     max_wait 保留仅为兼容旧调用。
     """
     targets = [(n, p, u) for n, u, _pid, p, _r in browsers
@@ -2287,6 +2358,62 @@ def _publish_port_map(account, port, muid="", email=""):
         logger.debug(f"  端口表写盘失败: {e}")
     short = (muid[:8] + "…") if muid else "未取到"
     logger.info(f"  🗺️ 端口表已发布：{account} → CDP {port}（MUID {short}）")
+
+
+def _prepublish_port_map(accounts, timeout: float = 30.0):
+    """浏览器都拉起来后，**一次性把全部账号**的「端口 + MUID」发布进端口表。
+
+    为什么要批量预发布：以前端口表是夹在 check_login 里的 —— 页面导航到
+    bing 域才发布，而且账号是串行处理的，第 4 个账号要等前 3 个各导航一次才轮到。
+    v1.0.0 的脚本按 @crontab 整点/20 分敲门，第 2~4 个账号常常在「自己还没被发布」
+    时就被唤醒，于是打出「端口表里没有本机 MUID」→ 回退 9222 → 多账号串号
+    （线上 joe 首轮就是这样），要到下一轮才恢复正常。
+
+    这里只做一件事：对每个已就绪的浏览器开一次 CDP、用 Network.getCookies 读 MUID
+    （不导航、不读页面，几秒内出结果），把全部账号一起写进端口表。
+    check_login 里那次发布保留，作为兜底刷新（MUID 变了/表被清掉时补回来）。
+    """
+    targets = []
+    for i, acc in enumerate(accounts):
+        port = CDP_BASE_PORT + i if CDP_BASE_PORT else 0
+        if not port:
+            continue
+        user_dir = os.path.join(CHROME_USER_DATA_BASE, f"user-{acc['name']}")
+        # 账号键统一用 profile 目录名（user-xxx），跟 check_login 里的发布保持一致，
+        # 免得同一台浏览器在端口表里出现两个名字，排查时对不上。
+        targets.append((os.path.basename(user_dir.rstrip("/")) or acc["name"],
+                        user_dir, port, acc.get("email") or ""))
+    if len(targets) < 2:
+        return 0        # 单账号没有串号风险，省掉这一次 CDP 往返
+
+    def _one(item):
+        name, user_dir, port, email = item
+        try:
+            if not wait_browser_ready(user_dir, port, timeout=int(timeout)):
+                return None
+            target = _find_page_target(port)
+            if not target:
+                return None
+            sess = _CdpSession(target["webSocketDebuggerUrl"])
+            try:
+                muid = _read_bing_muid(sess)
+            finally:
+                sess.close()
+            _publish_port_map(name, port, muid, email)
+            return muid
+        except Exception as e:
+            logger.debug(f"  端口表预发布失败（{name}）: {e}")
+            return None
+
+    ok = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as ex:
+        for muid in ex.map(_one, targets):
+            if muid:
+                ok += 1
+    # 成功也打一行汇总：这是「四账号端口有没有一次发全」的唯一判据
+    logger.info(f"  🗺️ 端口表批量预发布完成：{ok}/{len(targets)} 个账号"
+                + ("" if ok == len(targets) else "（其余由登录检查兜底补发）"))
+    return ok
 
 
 def check_login(port: int, expected_email: str, navigate: bool = True,
@@ -3205,7 +3332,7 @@ def stop_desktop():
     logger.info("🖥️  登录完成，停止桌面...")
     _run_desktop("stop")
     # websockify 随桌面一起停掉后 8080 会空出来：把之前让位的自建接口挂回去，
-    # 否则脚本猫在这之后的每分钟敲门就读不到端口映射/计划。
+    # 否则脚本猫在这之后的每次唤醒（每 20 分钟）就读不到端口映射。
     if _PLAN_HTTP_YIELDED:
         time.sleep(1)   # 等 websockify 释放 8080
         ensure_plan_http(_PLAN_HTTP_TEXT)
@@ -3872,8 +3999,9 @@ def write_run_plan(plan: dict, run_seconds: int, hold: bool = False):
 def set_plan_hold(hold: bool, ttl: int = 0):
     """改写计划里的「暂缓开跑」标记（校准前拦一下，校准完立刻放行）。
 
-    只改这一个字段并重写同一份计划，不动执行点所依赖的开机/收工时刻，
-    所以脚本侧的排程不会因此重算。
+    只改这一个字段并重写同一份计划，不动开机/收工时刻，所以脚本侧的排程不会因此重算。
+    ⚠️ v1.0.0 起脚本按自己的 @crontab 每 20 分钟唤醒、不再读计划，
+       所以 hold 对新脚本**无效**，保留只为「回退到 v0.90 及更早」时还能拦一下。
     """
     data = dict(_PLAN_LAST)
     if not data:
@@ -3890,7 +4018,8 @@ def set_plan_hold(hold: bool, ttl: int = 0):
     if hold:
         logger.info(f"⏸️ 已置「暂缓开跑」标记（{ttl} 秒后自动失效，防脚本被永久卡住）")
     else:
-        logger.info("🔓 已放行：计划里的「暂缓开跑」已解除，脚本下一个执行点即可开跑")
+        logger.info("🔓 已放行：计划里的「暂缓开跑」已解除"
+                    "（v1.0.0 起脚本不读计划，此行仅作记录）")
     return True
 
 
@@ -3962,7 +4091,8 @@ def main():
 
     # 开工判定：面板每天 9:00 只拉起本脚本一次，开机时刻由这里在 RUN_WINDOW
     # （默认 09:00-15:00）内随机挑；没到点就等，等待期间只占一个空闲进程，
-    # 浏览器不启动。真正的签到执行时刻由「脚本猫」读计划文件后二次随机。
+    # 浏览器不启动。真正的签到执行时刻归「脚本猫」自己：v1.0.0 起它按 @crontab
+    # 每 20 分钟唤醒、按 Config.winTime 判断时段，不再读这份计划的执行时刻。
     plan = wait_for_run_window(run_seconds)
     if plan is None:
         logger.info("本次不启动浏览器（原因见上方 ⏰ 日志），任务结束")
@@ -4005,6 +4135,14 @@ def main():
             prelaunch_accounts(accounts)
         except Exception as e:
             logger.warning(f"⚠️ 并发预启动失败（主循环会逐个再试）：{e}")
+        # 🗺️ 端口表批量预发布：所有账号的「端口 + MUID」一次性写出去。
+        # 抢在脚本猫第一次 cron 敲门（:00/:20/:40）之前完成，否则靠后的账号会在
+        # 「自己还没被发布」时被唤醒 → 认领失败 → 回退 9222 → 多账号串号。
+        # 只读 cookie（不导航），四个账号并发几秒出结果；失败也不影响后面逐个补发。
+        try:
+            _prepublish_port_map(accounts)
+        except Exception as e:
+            logger.warning(f"⚠️ 端口表批量预发布失败（登录检查会逐个补发）: {e}")
 
     # 逐个账号：启动浏览器（已预启动则沿用） → 登录检查
     browsers = []  # (name, user_dir, pid, port, login_result)
@@ -4026,7 +4164,30 @@ def main():
                 time.sleep(2)
                 pid = None
         if pid:
-            logger.info(f"ℹ️  账号 {name} 的浏览器已在运行（PID={pid}，{_mode_label(_browser_launch_mode(user_dir)[0])}），本次沿用")
+            # 🕐 寿命校验：跨天/上次崩溃残留的浏览器不再无条件沿用。
+            # 「已在运行」只说明进程活着，不说明它还能干活：登录态可能早就掉了、
+            # 脚本猫后台上下文可能被 MV3 冻结弄死、cron 可能压根没挂上。线上 joe
+            # 就是沿用了一个陈旧实例 —— 端口表认领得到，脚本却读不到登录态，整轮白跑。
+            # 过寿命就重建，代价是这一个账号晚一轮开跑，收益是状态干净。
+            age = _proc_age_sec(pid)
+            if age is not None and BROWSER_MAX_AGE_HOURS > 0 and age > BROWSER_MAX_AGE_HOURS * 3600:
+                logger.warning(f"⚠️ 账号 {name} 沿用的浏览器已连续运行 {age / 3600:.1f} 小时"
+                               f"（上限 {BROWSER_MAX_AGE_HOURS:g} 小时）→ 关掉重建"
+                               f"（陈旧实例的登录态/扩展后台/cron 挂载都可能已失效）")
+                close_browser(user_dir, port)
+                time.sleep(2)
+                if get_running_pid(user_dir):
+                    logger.warning(f"  ⚠️ 账号 {name} 旧实例未退出，改为强制清理")
+                    kill_all_for_profile(user_dir)
+                pid = None
+        if pid:
+            _age_txt = ""
+            _age = _proc_age_sec(pid)
+            if _age is not None:
+                _age_txt = (f"，已运行 {_age / 3600:.1f} 小时" if _age >= 3600
+                            else f"，已运行 {_age / 60:.0f} 分钟")
+            logger.info(f"ℹ️  账号 {name} 的浏览器已在运行（PID={pid}{_age_txt}，"
+                        f"{_mode_label(_browser_launch_mode(user_dir)[0])}），本次沿用")
             # 沿用的浏览器也可能是刚被拉起的，等 CDP 页面就绪再查登录（就绪时秒回）
             wait_browser_ready(user_dir, port)
         else:
@@ -4308,8 +4469,9 @@ def main():
         threading.Thread(target=_no_run_watch, name="no-run-watch", daemon=True).start()
 
     # 🧩 开跑前一次性版本校准（脚本 + 扩展插件）：
-    #    写计划时已经置了「暂缓开跑」，脚本不会抢先开跑；四个账号部署完就立刻校准，
-    #    不再等「脚本猫首轮心跳」（那一步只会让提示和升级都晚 30~100 秒）。
+    #    写计划时仍然会置「暂缓开跑」，v1.0.0 之前的脚本会读到它、不会抢先开跑；
+    #    v1.0.0 起脚本不读计划了，全靠 _wait_rounds_idle 看轮次空窗兜住。
+    #    四个账号部署完就立刻校准，不再等「脚本猫首轮心跳」。
     if (SC_AUTO_UPDATE or SC_EXT_UPDATE) and browsers:
         threading.Thread(target=_pre_task_calibrate, args=(browsers, plan, 0),
                          name="pre-task-calibrate", daemon=True).start()
