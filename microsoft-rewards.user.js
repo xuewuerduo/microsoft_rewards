@@ -9,7 +9,7 @@
 // @homepageURL  https://scriptcat.org/zh-CN/script-show-page/6006
 // @website      https://scriptcat.org/zh-CN/script-show-page/6006
 // @supportURL   https://scriptcat.org/zh-CN/script-show-page/6006/issue/create
-// @source       https://github.com/hidmould/MicrosoftPoints
+// @source       https://gitea.zh-cc.top/lilonglong/microsoft_rewards
 // @crontab      */20 * * * *
 // @connect      bing.com
 // @connect      login.live.com

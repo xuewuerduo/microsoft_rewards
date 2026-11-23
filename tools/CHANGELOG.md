@@ -15,7 +15,7 @@
 ## v1.0.0 · 2026-11-23（仅 zy.py · 配套新版脚本：端口表批量预发布 / 浏览器寿命校验 / 停摆阈值按 20 分钟节拍）
 
 这一节只动 `zy.py`（4750 行，MD5 `a614cf73`）；脚本本体除元数据里的主页地址外没有改动
-（11301 行，MD5 `f1b309c7`）。换底座之后，脚本的节拍从「每分钟敲门」
+（11301 行，MD5 `17247720`）。换底座之后，脚本的节拍从「每分钟敲门」
 变成「每 20 分钟跑一轮」，`zy.py` 里三处按旧节拍写的假定必须跟着改，否则换版当天就会踩坑。
 
 ### 现象（换版前那些日志里的老毛病）
@@ -62,7 +62,7 @@ joe 还有更典型的一次：浏览器被「已在运行，本次沿用」捡�
 | 文件 | 行数 | MD5（前 8 位） | 是否需重新上传 |
 |---|---|---|---|
 | `tools/zy.py` | 4750 | `a614cf73` | **是** |
-| `microsoft-rewards.user.js` | 11301 | `f1b309c7` | 是（只改了主页元数据） |
+| `microsoft-rewards.user.js` | 11301 | `17247720` | 是（只改了主页元数据） |
 | `tools/sc_deploy.py` | 2532 | 未改动 | 否 |
 
 ### 怎么验证改对了
@@ -151,8 +151,9 @@ marvin 一小时只把阅读从 21/30 推到 24/30、marvin-1 的 Edge 停在 0/
 
 ### 影响文件
 
-- `microsoft-rewards.user.js`（v0.90 → v1.0.0，**11301 行 / md5 `f1b309c7`**）：
-  元数据里的 `@homepage` / `@homepageURL` / `@website` / `@supportURL` 全部指回**自己的商店页** `https://scriptcat.org/zh-CN/script-show-page/6006`（原来是参考脚本 #8787 的页面，装的人点「主页/反馈」会跑到别人那儿去）
+- `microsoft-rewards.user.js`（v0.90 → v1.0.0，**11301 行 / md5 `17247720`**）：
+  元数据里的 `@homepage` / `@homepageURL` / `@website` / `@supportURL` 全部指回**自己的商店页** `https://scriptcat.org/zh-CN/script-show-page/6006`（原来是参考脚本 #8787 的页面，装的人点「主页/反馈」会跑到别人那儿去）；
+  `@source` 从参考脚本作者的 GitHub 改为**自己的仓库** `https://gitea.zh-cc.top/lilonglong/microsoft_rewards`
 - `tools/REFERENCE-8787.md`（新增：参考脚本解读 + 回归方案，193 行）
 - `tools/README.md`（目录树加一行）
 - `tools/release-notes/v1.0.0.md`（商店更新说明）
