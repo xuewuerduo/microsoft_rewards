@@ -3,9 +3,9 @@
 """
 sc_diag.py — 一次性「账号排程」诊断工具（在容器里跑）
 
-用途：扫描 4 个 CDP 端口（9222~9225），从脚本猫 IndexedDB 的 logger 表里
+用途：扫描 5 个 CDP 端口（9222~9226），从脚本猫 IndexedDB 的 logger 表里
 拉出每个账号的关键日志行——认领端口 / 已读取计划 / 本账号今日排程 /
-下一执行点 / 定时唤醒开跑 / 空敲门跳过。用来判断某个账号（如 joe）
+下一执行点 / 定时唤醒开跑 / 空敲门跳过。用来判断某个账号（如 marvin-1）
 到底有没有生成执行点、执行点排在哪、到点有没有真跑。
 
 这些日志是脚本自己写进 IndexedDB 的，即使当时没被 zy.py 的前台采集器抓到，
@@ -16,11 +16,11 @@ sc_diag.py — 一次性「账号排程」诊断工具（在容器里跑）
     python3 tools/sc_diag.py
 
 可选参数：
-    python3 tools/sc_diag.py --ports 9222,9223,9224,9225
+    python3 tools/sc_diag.py --ports 9222,9223,9224,9225,9226
     python3 tools/sc_diag.py --self-test          # 本机自检，用假数据验证工具本身
 
 如果没有 ·认领端口· 行，说明脚本没走到端口解析（可能没在跑），工具仍会
-按端口顺序标注 long/marvin/joe/Dean。
+按端口顺序标注 long/marvin/marvin-1/joe/Dean。
 """
 
 import os
@@ -36,7 +36,7 @@ import urllib.request
 from urllib.parse import urlparse
 
 # 默认账号顺序（与 zy.py 的 CDP_BASE_PORT 逐个 +1 对应）
-DEFAULT_NAMES = ["long", "marvin", "joe", "Dean"]
+DEFAULT_NAMES = ["long", "marvin", "marvin-1", "joe", "Dean"]
 
 # 只挑这些关键行，避免刷屏
 KEYWORDS = [
@@ -304,8 +304,8 @@ def _self_test():
 
 def main():
     ap = argparse.ArgumentParser(description="账号排程诊断（读脚本猫 IndexedDB 日志）")
-    ap.add_argument("--ports", default=None, help="CDP 端口列表，逗号分隔（默认 9222~9225）")
-    ap.add_argument("--names", default=None, help="账号名列表，逗号分隔（默认 long,marvin,joe,Dean）")
+    ap.add_argument("--ports", default=None, help="CDP 端口列表，逗号分隔（默认 9222~9226）")
+    ap.add_argument("--names", default=None, help="账号名列表，逗号分隔（默认 long,marvin,marvin-1,joe,Dean）")
     ap.add_argument("--self-test", action="store_true", help="本机自检（假数据），不连容器")
     args = ap.parse_args()
 
@@ -314,7 +314,7 @@ def main():
         return
 
     ports = ([int(x) for x in args.ports.split(",")]
-             if args.ports else list(range(9222, 9226)))
+             if args.ports else list(range(9222, 9227)))
     names = (args.names.split(",") if args.names else list(DEFAULT_NAMES))
 
     # mktime 需要 9 元素时间元组 (年,月,日,时,分,秒,周,年积日,夏令时)

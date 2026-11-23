@@ -77,7 +77,28 @@ from urllib.parse import urlparse, quote
 # ============================ 常量 ============================
 DEFAULT_SCRIPT_ID = "6006"                 # scriptcat 商店脚本 ID：微软积分（优化版）
 SCRIPT_NAME_HINT = "微软积分"               # 用来从已装脚本列表里认出目标脚本
-ACCOUNTS = [(9222, "long"), (9223, "marvin"), (9224, "joe"), (9225, "Dean")]
+
+
+def _accounts_from_env():
+    """从面板 BING_ACCOUNTS 派生 (端口, 名字) 列表，端口按账号顺序 9222+ 递增。
+    与 zy.py 的 CDP_BASE_PORT=9222 + 顺序分配保持一致；新增账号自动纳入。
+    读不到环境变量时退回旧的 5 账号常量（仅命令行手动运行时用，主流程 zy.py 按 port 调用）。"""
+    raw = os.getenv("BING_ACCOUNTS", "")
+    try:
+        arr = json.loads(raw) if raw else []
+        if isinstance(arr, list) and arr:
+            out = []
+            for i, a in enumerate(arr):
+                name = a.get("name") if isinstance(a, dict) else None
+                out.append((9222 + i, str(name or f"account{i + 1}")))
+            return out
+    except Exception:
+        pass
+    return [(9222, "long"), (9223, "marvin"), (9224, "marvin-1"),
+            (9225, "joe"), (9226, "Dean")]
+
+
+ACCOUNTS = _accounts_from_env()
 
 RPC_PREFIX = "serviceWorker/script/"
 # 扩展页面路径随版本变化：1.5.x 是 src/options.html，更老的版本是 pages/manage.html

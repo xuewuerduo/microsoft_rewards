@@ -106,8 +106,9 @@
       缺这个文件时会退回旧行为（只靠 --load-extension + 模板），不会中断任务。
 
    脚本猫日志采集开关 SC_LOG_CAPTURE / SC_LOG_POLL / SC_LOG_BASELINE
-                          （默认开启、30 秒轮询、now=仅本次任务新日志；
-                          改 all=连接后先倾倒历史日志）在脚本顶部常量中修改。
+                          （默认开启、30 秒轮询、all=连上后先倾倒「本次任务启动以来」
+                          的全部日志，避免部署慢的新账号漏掉首次计划/排程日志；
+                          改 now=仅收采集器挂载之后的新日志）在脚本顶部常量中修改。
 
 搜索/签到相关参数（关键词、搜索次数、搜索延迟、浏览时长、前台/后台模式等）
 请在脚本的 /* ==UserConfig== */ 中配置，脚本猫页面上可直接修改。
@@ -376,9 +377,14 @@ LUMEN_HOSTNAME_FILE = "/tmp/lumen-hostname"  # desktop.sh 读取后作为 lumen 
 # 🐱 脚本猫日志采集（读取脚本猫 IndexedDB「ScriptCat」库「logger」表 = 脚本猫「运行日志」同一数据源）
 SC_LOG_CAPTURE = True       # 是否采集脚本猫日志（GM_log + 后台脚本 console）
 SC_LOG_POLL = 30            # 轮询间隔（秒）；设置过小会导致刷新太快
-# now(默认)=只输出本次任务期间的新日志；all=连接后先倾倒「脚本运行开始时刻」以来的日志
+# all(默认)=连上后先倾倒「脚本运行开始时刻(_SCRIPT_START_TS)」以来的日志，再只收新日志。
+#   为什么默认 all：账号是串行部署+挂载的，靠后的账号（尤其新加的）部署最慢，
+#   它「装扩展→装脚本→重载→首次认领端口→首次生成计划」的日志全打在采集器挂载之前；
+#   用 now 会把这段整段丢掉 → 表现为「新账号看不到 📋计划/🎲排程」。
+#   倾倒起点是本次进程启动时刻，不会混入跨天/上次手动跑的历史日志，安全。
+# now=只输出采集器挂载之后的新日志（旧行为，可能漏掉部署慢账号的首次计划日志）。
 # （朱雀面板「环境变量」页添加 SC_LOG_BASELINE=now / all 可覆盖）
-SC_LOG_BASELINE = os.getenv("SC_LOG_BASELINE", "now").lower()
+SC_LOG_BASELINE = os.getenv("SC_LOG_BASELINE", "all").lower()
 # 前台隐藏「每分钟一条 exec script complete」空敲门日志：无信息量、纯刷屏。
 # 只影响 print，不影响日志采集、脚本脚印判定、任务完成判定（那些都在打印点之前）。
 # 想恢复显示：面板环境变量里设 SC_HIDE_HEARTBEAT=0
