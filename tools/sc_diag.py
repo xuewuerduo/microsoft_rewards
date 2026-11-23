@@ -3,24 +3,25 @@
 """
 sc_diag.py — 一次性「账号排程」诊断工具（在容器里跑）
 
-用途：扫描 5 个 CDP 端口（9222~9226），从脚本猫 IndexedDB 的 logger 表里
-拉出每个账号的关键日志行——认领端口 / 已读取计划 / 本账号今日排程 /
-下一执行点 / 定时唤醒开跑 / 空敲门跳过。用来判断某个账号（如 marvin-1）
-到底有没有生成执行点、执行点排在哪、到点有没有真跑。
+用途：从脚本猫 IndexedDB 的 logger 表里拉出每个账号的关键日志行——
+认领端口 / 已读取计划 / 本账号今日排程 / 下一执行点 / 定时唤醒开跑 /
+空敲门跳过。用来判断某个账号到底有没有生成执行点、排在哪、到点有没有真跑。
+
+账号和端口不写死：一律从 zy.py 发布的 zy-ports.json 读取（zy.py 从
+BING_ACCOUNTS 派生）。新增账号只要进了 zy.py，本工具自动就能诊断到。
 
 这些日志是脚本自己写进 IndexedDB 的，即使当时没被 zy.py 的前台采集器抓到，
 数据也还在，所以比看日志流更可靠。
 
-自包含，不依赖 zy.py，传这一个文件到容器即可运行：
+自包含，不依赖 zy.py，传这一个文件到容器即可运行（需 zy.py 已发布端口表）：
 
     python3 tools/sc_diag.py
 
 可选参数：
-    python3 tools/sc_diag.py --ports 9222,9223,9224,9225,9226
-    python3 tools/sc_diag.py --self-test          # 本机自检，用假数据验证工具本身
+    python3 tools/sc_diag.py --ports 9222,9223        # 手动覆盖端口（账号名退化为 port-N）
+    python3 tools/sc_diag.py --self-test              # 本机自检，用假数据验证工具本身
 
-如果没有 ·认领端口· 行，说明脚本没走到端口解析（可能没在跑），工具仍会
-按端口顺序标注 long/marvin/marvin-1/joe/Dean。
+读不到 zy-ports.json 时会明确提示先运行 zy.py，绝不用写死的账号猜测。
 """
 
 import os
@@ -35,8 +36,31 @@ import argparse
 import urllib.request
 from urllib.parse import urlparse
 
-# 默认账号顺序（与 zy.py 的 CDP_BASE_PORT 逐个 +1 对应）
-DEFAULT_NAMES = ["long", "marvin", "marvin-1", "joe", "Dean"]
+# 端口表由 zy.py 从 BING_ACCOUNTS 派生后发布，是本工具唯一的账号真相源；
+# 本工具不维护账号表——有哪些账号、各在哪个端口，一律从端口表读。
+PORT_MAP_FILES = [p for p in (
+    os.getenv("PORT_MAP_FILE", "/app/data/zy-ports.json"),
+    "/usr/share/novnc/zy-ports.json",
+) if p]
+
+
+def _ports_from_map():
+    """从 zy.py 发布的 zy-ports.json 读 (端口, 账号名) 列表；读不到返回空。"""
+    for path in PORT_MAP_FILES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                accounts = (json.load(f) or {}).get("accounts", {})
+            out = []
+            for name, info in accounts.items():
+                try:
+                    out.append((int(info["port"]), str(name)))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if out:
+                return sorted(out)
+        except Exception:
+            continue
+    return []
 
 # 只挑这些关键行，避免刷屏
 KEYWORDS = [
@@ -304,8 +328,7 @@ def _self_test():
 
 def main():
     ap = argparse.ArgumentParser(description="账号排程诊断（读脚本猫 IndexedDB 日志）")
-    ap.add_argument("--ports", default=None, help="CDP 端口列表，逗号分隔（默认 9222~9226）")
-    ap.add_argument("--names", default=None, help="账号名列表，逗号分隔（默认 long,marvin,marvin-1,joe,Dean）")
+    ap.add_argument("--ports", default=None, help="CDP 端口列表，逗号分隔（默认从 zy.py 端口表读取）")
     ap.add_argument("--self-test", action="store_true", help="本机自检（假数据），不连容器")
     args = ap.parse_args()
 
@@ -313,9 +336,18 @@ def main():
         _self_test()
         return
 
-    ports = ([int(x) for x in args.ports.split(",")]
-             if args.ports else list(range(9222, 9227)))
-    names = (args.names.split(",") if args.names else list(DEFAULT_NAMES))
+    # 账号和端口一律来自 zy.py 端口表；--ports 只是手动覆盖端口（名字退化为 port-N）
+    mapped = _ports_from_map()
+    if args.ports:
+        name_by_port = {p: n for n, p in mapped}
+        ports = [(p, name_by_port.get(p, f"port-{p}"))
+                 for p in (int(x) for x in args.ports.split(","))]
+    elif mapped:
+        ports = mapped
+    else:
+        print("[!] 读不到 zy.py 发布的端口表（zy-ports.json）："
+              "请先运行 zy.py，或用 --ports 显式指定端口。")
+        return 2
 
     # mktime 需要 9 元素时间元组 (年,月,日,时,分,秒,周,年积日,夏令时)
     _tm = time.localtime()
@@ -325,8 +357,7 @@ def main():
     print(f"账号排程诊断  {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 68)
 
-    for i, port in enumerate(ports):
-        fallback = names[i] if i < len(names) else f"port-{port}"
+    for port, fallback in ports:
         logs, err = _read_account_logs(port, today0)
         if err and not logs:
             print(f"\n[{fallback} @ CDP {port}]  {err}")
@@ -345,4 +376,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

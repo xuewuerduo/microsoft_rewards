@@ -79,26 +79,35 @@ DEFAULT_SCRIPT_ID = "6006"                 # scriptcat 商店脚本 ID：微软�
 SCRIPT_NAME_HINT = "微软积分"               # 用来从已装脚本列表里认出目标脚本
 
 
-def _accounts_from_env():
-    """从面板 BING_ACCOUNTS 派生 (端口, 名字) 列表，端口按账号顺序 9222+ 递增。
-    与 zy.py 的 CDP_BASE_PORT=9222 + 顺序分配保持一致；新增账号自动纳入。
-    读不到环境变量时退回旧的 5 账号常量（仅命令行手动运行时用，主流程 zy.py 按 port 调用）。"""
-    raw = os.getenv("BING_ACCOUNTS", "")
-    try:
-        arr = json.loads(raw) if raw else []
-        if isinstance(arr, list) and arr:
+# 端口表由 zy.py 从 BING_ACCOUNTS 派生后发布，是被调工具唯一的账号真相源。
+# sc_deploy 自己不维护任何账号表：账号从哪来、几个、端口多少，一律问端口表。
+PORT_MAP_FILES = [p for p in (
+    os.getenv("PORT_MAP_FILE", "/app/data/zy-ports.json"),
+    "/usr/share/novnc/zy-ports.json",
+) if p]
+
+
+def _ports_from_map():
+    """从 zy.py 发布的 zy-ports.json 读 (端口, 账号名) 列表。
+
+    主流程里 zy.py 直接按 port 调用本模块的函数，根本用不到账号名；
+    这里只服务于「不带 --port 的命令行批量模式」。读不到返回空列表，
+    由调用方提示先跑 zy.py 或用 --port 显式指定，绝不回退到写死账号。"""
+    for path in PORT_MAP_FILES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                accounts = (json.load(f) or {}).get("accounts", {})
             out = []
-            for i, a in enumerate(arr):
-                name = a.get("name") if isinstance(a, dict) else None
-                out.append((9222 + i, str(name or f"account{i + 1}")))
-            return out
-    except Exception:
-        pass
-    return [(9222, "long"), (9223, "marvin"), (9224, "marvin-1"),
-            (9225, "joe"), (9226, "Dean")]
-
-
-ACCOUNTS = _accounts_from_env()
+            for name, info in accounts.items():
+                try:
+                    out.append((int(info["port"]), str(name)))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            if out:
+                return sorted(out)
+        except Exception:
+            continue
+    return []
 
 RPC_PREFIX = "serviceWorker/script/"
 # 扩展页面路径随版本变化：1.5.x 是 src/options.html，更老的版本是 pages/manage.html
@@ -2445,7 +2454,11 @@ def main():
                  ("；" + r["note"]) if r["note"] else ""))
         return 0 if r["ok"] else 1
 
-    ports = [(args.port, "指定端口")] if args.port else ACCOUNTS
+    ports = [(args.port, "指定端口")] if args.port else _ports_from_map()
+    if not ports:
+        print("[!] 读不到 zy.py 发布的端口表（zy-ports.json）："
+              "请先运行 zy.py，或用 --port 显式指定 CDP 端口。")
+        return 2
 
     if args.allow_userscripts:
         ok_all = True
