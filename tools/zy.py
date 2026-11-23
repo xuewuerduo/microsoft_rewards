@@ -379,6 +379,10 @@ SC_LOG_POLL = 30            # 轮询间隔（秒）；设置过小会导致刷�
 # now(默认)=只输出本次任务期间的新日志；all=连接后先倾倒「脚本运行开始时刻」以来的日志
 # （朱雀面板「环境变量」页添加 SC_LOG_BASELINE=now / all 可覆盖）
 SC_LOG_BASELINE = os.getenv("SC_LOG_BASELINE", "now").lower()
+# 前台隐藏「每分钟一条 exec script complete」空敲门日志：无信息量、纯刷屏。
+# 只影响 print，不影响日志采集、脚本脚印判定、任务完成判定（那些都在打印点之前）。
+# 想恢复显示：面板环境变量里设 SC_HIDE_HEARTBEAT=0
+SC_HIDE_HEARTBEAT = os.getenv("SC_HIDE_HEARTBEAT", "1").lower() in ("1", "true", "yes", "on")
 _SCRIPT_START_TS = int(time.time() * 1000)   # 脚本运行开始时刻（baseline=all 时作为日志游标起点）
 
 # 🚨 账号脚本「完全没跑」告警：浏览器已启动、但宽限期内一条用户脚本日志都没有 → 单独告警
@@ -982,7 +986,13 @@ def _sc_reader(name, port):
                                             _on_account_done(name, None)
                                         ts = lg.get("t") or 0
                                         tt = time.strftime("%H:%M:%S", time.localtime(ts / 1000)) if ts else "--:--:--"
-                                        print(f"[{tt}] [{name}] [{lvl}] {line}", flush=True)
+                                        # 空敲门心跳：只拦前台打印，脚印/游标/完成判定都不受影响
+                                        if (SC_HIDE_HEARTBEAT
+                                                and lvl == "info"
+                                                and line.strip() == "exec script complete"):
+                                            pass
+                                        else:
+                                            print(f"[{tt}] [{name}] [{lvl}] {line}", flush=True)
                                         if lvl == "error":
                                             errs.append(f"{tag}: {line}")
                                     if max_ts > last_ts:
@@ -1146,18 +1156,48 @@ def find_chrome():
     raise FileNotFoundError("❌ 未找到 Chromium 可执行文件，请设置环境变量 CHROME_BIN")
 
 
-def get_running_pid(user_dir: str):
-    """返回使用该用户目录的浏览器主进程 PID，无则返回 None"""
+def _pids_for_user_dir(user_dir: str) -> list:
+    """精确找出所有「启动参数里 --user-data-dir 恰好等于 user_dir」的进程 PID。
+
+    为什么不用 pgrep -f 子串匹配：user-marvin 是 user-marvin-1 的前缀，
+    `pgrep -f "user-data-dir=/data/profiles/user-marvin"` 会把 marvin-1 的
+    浏览器也抓进来；取第一个就串号（marvin 沿用 marvin-1 的 PID）。
+    kill_all_for_profile 用同样的子串匹配更危险——切 GUI 清理 marvin 时
+    会连 marvin-1 一起杀掉。
+    这里逐进程读 /proc/<pid>/cmdline，按 NUL 切分参数后做「规范化后精确相等」
+    比较（容忍尾随斜杠差异），彻底避开前缀命中。
+    """
+    want = os.path.normpath(user_dir)
+    out = []
     try:
-        ret = subprocess.run(
-            ["pgrep", "-f", f"user-data-dir={user_dir}"],
-            capture_output=True, text=True
-        )
-        if ret.returncode == 0 and ret.stdout.strip():
-            return int(ret.stdout.strip().split()[0])
-    except Exception:
-        pass
-    return None
+        names = os.listdir("/proc")
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                raw = f.read()
+        except (OSError, IOError):
+            continue
+        if b"user-data-dir=" not in raw:      # 快速跳过绝大多数进程
+            continue
+        for arg in raw.split(b"\0"):
+            if not arg.startswith(b"--user-data-dir="):
+                continue
+            got = os.path.normpath(arg.split(b"=", 1)[1].decode("utf-8", "replace"))
+            if got == want:
+                out.append(pid)
+                break
+    return out
+
+
+def get_running_pid(user_dir: str):
+    """返回使用该用户目录的浏览器主进程 PID（精确匹配 profile 路径，无则 None）。"""
+    pids = _pids_for_user_dir(user_dir)
+    return min(pids) if pids else None
 
 
 def _browser_argv(pid: int) -> list:
@@ -1197,13 +1237,11 @@ def _mode_label(mode) -> str:
 
 def kill_all_for_profile(user_dir: str):
     """强制结束所有使用该用户目录的浏览器进程（含子进程树）。
-    用于切换到 GUI 模式前彻底清理残留 headless 实例，避免与 GUI 抢 profile。"""
+    用于切换到 GUI 模式前彻底清理残留 headless 实例，避免与 GUI 抢 profile。
+    用 _pids_for_user_dir 精确匹配 profile 路径，避免 user-marvin 前缀命中
+    user-marvin-1 而误杀另一个账号的浏览器。"""
     try:
-        ret = subprocess.run(
-            ["pgrep", "-f", f"user-data-dir={user_dir}"],
-            capture_output=True, text=True
-        )
-        pids = [int(x) for x in ret.stdout.strip().split()] if ret.returncode == 0 and ret.stdout.strip() else []
+        pids = _pids_for_user_dir(user_dir)
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGTERM)

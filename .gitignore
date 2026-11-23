@@ -16,3 +16,6 @@ fix_planurl.py
 .sc-ext-latest.json
 *.bak-*
 *.new-*
+
+# IDE 本地配置
+.idea/

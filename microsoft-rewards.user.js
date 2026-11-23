@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      0.86
+// @version      0.88
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；已适配 zy 版逻辑（每日随机排程、中文热搜、llq.py 上报、多账号 CDP 端口）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -58,15 +58,15 @@
 /* ==UserConfig==
 Config:
     span:
-        title: 搜索间隔基准(每次在 基准×0.6 ~ 基准×2.2 之间随机，另有 10% 概率来一次 3~8 倍长停顿)
+        title: 搜索/阅读间隔上限(每次在 0~上限 之间真随机，另有 10% 概率来一次 5 分钟长等待)
         type: number
-        default: 120
+        default: 180
         min: 60
         unit: 秒
     otherSpan:
-        title: 其他任务间隔基准(阅读/活动卡片/每日活动/国际版活动/二次扫描，每次在 基准 ±15 秒之间随机)
+        title: 其他任务间隔上限(活动卡片/每日活动/国际版活动/二次扫描，每次在 0~上限 之间真随机，10% 概率 5 分钟长等待)
         type: number
-        default: 180
+        default: 120
         min: 10
         unit: 秒
     keep:
@@ -8174,36 +8174,33 @@ const __scBgKeepAlive = (function() {
     const ROUND_TOTAL_MAX = 6 * 60 * 60 * 1000;
 
     const SEARCH_PACER = {
-        /* ── 两套间隔基准，都在脚本顶部的 UserConfig 里配，不用改代码 ──
-           Config.span      = 搜索间隔基准（默认 60 秒，最低 60 秒）
-                              → cycle() 每次独立抽样，落在 基准×0.6 ~ ×2.2
-           Config.otherSpan = 其他任务间隔基准（阅读/活动卡片/每日活动/
-                              国际版活动/二次扫描，默认 60 秒，最低 10 秒）
-                              → jitter() 固定 ±15 秒对称浮动
-           FLOOR_MS=5 秒只防负数；限流保护靠两条刹车：
-           NO_CREDIT_LIMIT（连续 10 分钟零记账收手）、MAX_ATTEMPTS。 */
+        /* ── v0.88 节拍重构：三类任务统一「范围内真随机 + 偶发 5 分钟长等待」──
+           Config.span      = 搜索 / 阅读的间隔上限（默认 180 秒）
+                              → sampleGap() 每次在 [FLOOR_MS, 上限] 均匀随机抽一个值
+           Config.otherSpan = 其他任务的间隔上限（活动卡片/每日活动/国际版/
+                              二次扫描，默认 120 秒）
+           所有任务统一：LONG_PAUSE_P 概率来一次 LONG_WAIT_MS（固定 5 分钟）长等待。
+           不再有「基准×倍率」或「±15 秒」这类固定节拍 —— 每次独立抽、与上一次无关。
+           FLOOR_MS=3 秒只防 delay(0) 连发（视觉上等同「0 起」）；
+           限流保护仍靠 NO_CREDIT_LIMIT（连续 10 分钟零记账收手）、MAX_ATTEMPTS。 */
         SPAN_MIN_MS: 60 * 1000,
-        /* 其他任务（阅读/活动卡片/每日活动/国际版活动/二次扫描）的独立基准，
-           由 Config.otherSpan 配置，默认 60 秒。下限 10 秒只用来挡 0/负数，
-           真实节奏完全交给配置 —— 想让阅读更慢就把它调大，不必动搜索。 */
+        /* 其他任务的间隔上限：Config.otherSpan（默认 120 秒，最低 10 秒）。
+           下限只用来挡 0/负数，真实节奏完全交给配置。 */
         OTHER_SPAN_MIN_MS: 10 * 1000,
-        JITTER_MS: 15 * 1000,
-        /* ── 搜索间隔：每次重新抽一个随机值，不是「基准 ±15 秒」的固定节拍 ──
-           正常落在 [基准×0.6, 基准×2.2]；另有 LONG_PAUSE_P 的概率来一次
-           基准×3~8 的长停顿（像人离开一会儿），让节奏看不出规律。 */
-        CYCLE_MIN_RATIO: 0.6,
-        CYCLE_MAX_RATIO: 2.2,
-        LONG_PAUSE_P: 0.10,
-        LONG_PAUSE_MIN: 3,
-        LONG_PAUSE_MAX: 8,
-        /* ── 本轮份额：围绕「还差 ÷ 剩余轮数」随机摆动，不做等分 ──
-           factor 偏小（多数轮次少搜几次、偶尔一轮猛搜），剩余 3 轮以上时
-           还有 SKIP_P 的概率整轮跳过，把份额挪到别的时间点。 */
+        /* 时间预估余量：fits() 判断「下一次动作塞不塞得进交班点」时用，
+           不是节拍抖动 —— 新抽样没有 ±15 秒抖动，这里只留 5 秒余量。 */
+        GAP_RESERVE_MS: 5 * 1000,
+        LONG_PAUSE_P: 0.10,             // 10% 概率来一次长等待
+        LONG_WAIT_MS: 5 * 60 * 1000,    // 长等待固定 5 分钟（用户 2026-11-23 指定）
+        /* ── 分批：把当天剩余总量摊到剩余执行点（见 pickShare）。
+           factor 在 [SHARE_MIN, SHARE_MAX] 随机且偏小，做到「少量多次」：
+           前面几轮各跑一小份，最后一轮把剩余全部做完兜底，绝不跨天丢任务。
+           SKIP_P 保留字段但节点模式下不启用（每轮至少 1 次）。 */
         SHARE_MIN: 0.4,
         SHARE_MAX: 1.9,
-        SKIP_P: 0.15,
-        /* 浮动后的绝对下限：只用来挡住负数/0，不是「最慢不能低于 1 分钟」 */
-        FLOOR_MS: 5 * 1000,
+        SKIP_P: 0,
+        /* 抽样的绝对下限：只挡住 delay(0) 连发，不是「最慢不低于 1 分钟」 */
+        FLOOR_MS: 3 * 1000,
         OBSERVE_MIN: 5 * 1000,
         OBSERVE_MAX: 10 * 1000,
         VERIFY_MIN: 5 * 1000,
@@ -8218,87 +8215,94 @@ const __scBgKeepAlive = (function() {
         /* 用户配置的间隔基准：只保证不低于 SPAN_MIN_MS（60 秒），
            上限完全交给用户 —— 想设 10 分钟、1 小时都行。 */
         spanMs() {
-            const span = Number(GM_getValue("Config.span", 60)) || 60;
+            const span = Number(GM_getValue("Config.span", 180)) || 180;
             const ms = Math.round(span * 1000);
             return Math.max(this.SPAN_MIN_MS, ms);
         },
 
         minMs() { return this.spanMs(); },
 
-        /* 其他任务的间隔基准：Config.otherSpan（默认 60 秒）。
-           这一类不抽 cycle()，只做 ±JITTER_MS 的对称浮动，节奏比搜索稳。 */
+        /* 其他任务的间隔上限：Config.otherSpan（默认 120 秒）。
+           scope="other" 走这套，其余（含阅读 "read"、搜索默认）走 spanMs()。 */
         otherSpanMs() {
-            const span = Number(GM_getValue("Config.otherSpan", 60)) || 60;
+            const span = Number(GM_getValue("Config.otherSpan", 120)) || 120;
             return Math.max(this.OTHER_SPAN_MIN_MS, Math.round(span * 1000));
         },
 
-        /* scope="other" 取其他任务基准，其余（含不传）都取搜索基准。 */
-        startGap(scope) { return scope === "other" ? this.otherSpanMs() : this.minMs(); },
+        /* scope="other" 取其他任务上限，其余（含 "read" / 不传）取搜索上限。
+           返回的已经是「本次要等的毫秒数」（抽样后的值），不再只是基准。 */
+        startGap(scope) { return this.sampleGap(scope === "other" ? this.otherSpanMs() : this.spanMs()); },
 
-        /* 兼容旧调用点：现在没有退让，上限就等于基准值。 */
+        /* 兼容旧调用点：上限就等于基准值。 */
         maxMs() { return this.spanMs(); },
 
-        /* 对称浮动：base ± JITTER_MS，两侧等概率，不再向上单向。
-           地板只取 FLOOR_MS（5 秒，防负数），不设上限；配 60 时实际 45~75 秒，
-           向下浮动真的会生效 —— 这正是「取消下限」的效果。 */
-        jitter(ms) {
-            const base = Number(ms) || this.minMs();
-            const delta = (Math.random() * 2 - 1) * this.JITTER_MS;
-            const out = Math.round((base + delta) / 1000) * 1000;
-            return Math.max(this.FLOOR_MS, out);
+        /* ── 核心抽样：范围内真随机 + 偶发 5 分钟长等待 ──
+           给定上限 upper，LONG_PAUSE_P 概率返回固定 5 分钟长等待；
+           否则在 [FLOOR_MS, upper] 均匀随机抽一个秒级整数。
+           两次调用彼此独立，与上一次间隔无关 —— 这就是「0 起全范围随机」。
+           阅读/搜索传 spanMs()（180 秒），其他任务传 otherSpanMs()（120 秒）。 */
+        sampleGap(upper) {
+            const cap = Math.max(this.FLOOR_MS, Number(upper) || this.spanMs());
+            if (Math.random() < this.LONG_PAUSE_P) return this.LONG_WAIT_MS;
+            const ms = this.FLOOR_MS + Math.random() * (cap - this.FLOOR_MS);
+            return Math.max(this.FLOOR_MS, Math.round(ms / 1000) * 1000);
         },
 
-        /* 不再退让：无论上一轮是否记账，下一次都用同一个基准间隔。
-           保留 (gap, progressed) 形参是为了不改所有调用点；
-           scope="other" 时返回其他任务的基准，别把搜索的基准串到阅读/卡片上。 */
+        /* 兼容旧调用点：beat() 内部曾靠 jitter 做 ±15 秒浮动，
+           现在 sampleGap 已完整承担随机，jitter 直接返回抽样值。 */
+        jitter(ms) { return this.sampleGap(Number(ms) || this.minMs()); },
+
+        /* 每次都重新抽样（不依赖上一轮 gap / 是否记账）。
+           scope="other" 走其他任务上限，否则走搜索上限。 */
         nextGap(gap, progressed, scope) {
             return this.startGap(scope);
         },
 
-        /* 搜索用的间隔：每次独立抽样，两次之间没有任何连续性 —— 不比上一轮长，
-           也不比上一轮短，纯粹重抽。基准由 Config.span 决定。 */
-        cycle() {
-            const base = this.spanMs();
-            const ms = Math.random() < this.LONG_PAUSE_P
-                ? base * (this.LONG_PAUSE_MIN + Math.random() * (this.LONG_PAUSE_MAX - this.LONG_PAUSE_MIN))
-                : base * (this.CYCLE_MIN_RATIO + Math.random() * (this.CYCLE_MAX_RATIO - this.CYCLE_MIN_RATIO));
-            return Math.max(this.FLOOR_MS, Math.round(ms / 1000) * 1000);
-        },
-        cycleMin() { return Math.round(this.spanMs() * this.CYCLE_MIN_RATIO); },
-        cycleMax() { return Math.round(this.spanMs() * this.CYCLE_MAX_RATIO); },
-        pauseMax() { return Math.round(this.spanMs() * this.LONG_PAUSE_MAX); },
+        /* 搜索用的间隔：与 startGap 同源，均匀随机 + 偶发 5 分钟长停顿。 */
+        cycle() { return this.sampleGap(this.spanMs()); },
+        cycleMin() { return this.FLOOR_MS; },
+        cycleMax() { return this.spanMs(); },
+        pauseMax() { return this.LONG_WAIT_MS; },
 
-        /* 本轮该搜几次：随机分配，但不低于「平均值向上取整」，且至少 1 次。
-           ⚠ 下限是硬要求：以前允许整轮跳过（返回 0）和只搜 1 次，一旦某轮被
-           「上下文销毁 / 到点交班 / 冷却」吃掉，剩余配额就再也追不回来 ——
-           日志里 Dean 还剩 30 分、只剩 5 个执行点，每轮却只分到 1 次，
-           到 18:00 最多再做 5 次（15 分），剩下 15 分必然跨天丢掉。
-           现在每轮至少 ceil(平均)；配额快满（平均 < 1）时也给 1 次，让收尾提前，
-           不再出现「随机跳过整轮」把时间空着。 */
+        /* v0.88 分批：把「今天剩余总量」摊到剩余执行点，少量多次、最后兜底。
+           用户要的效果（2026-11-23）：搜索 10 次拆 3 批 ≈ 2 / 5 / 3 —— 每次不等分、
+           随机大小，批次之间也随机（批次间隔 = 执行点间隔，本就随机）。
+           算法：
+             · left<=1（最后一个执行点）：把剩余全做完，绝不跨天丢任务；
+             · 其余每轮先给后面每一轮各留 1 次（reserve = left-1），
+               本轮上限 cap = n - reserve（≥1）；
+             · 本轮以「平均值 n/left」为基数、用 factor 偏向小份抽一个值（少量多次），
+               再用 cap 夹住上限；没做完的量自然累积到后面几轮，最后一轮兜底。
+           n<=left 时每轮只够 1 次，也照常推进，不会跳过。 */
         pickShare(needed, roundsLeft) {
             const n = Math.max(0, Math.round(Number(needed) || 0));
             const left = Math.max(1, Math.round(Number(roundsLeft) || 1));
             if (n <= 0) return 0;
-            /* 最后一轮 / 只剩一两次：不随机，做完收工 */
-            if (left <= 1 || n <= 2) return n;
+            if (left <= 1) return n;                        // 最后一批：全做完兜底
+            const reserve = left - 1;                        // 给后面每轮留 1 次
+            const cap = Math.max(1, n - reserve);            // 本轮最多能拿几次
+            if (cap === 1) return 1;                         // 次数紧张：本轮只做 1 次
+            /* 以「平均值」为基数抽小份：random^1.4 让 factor 多数落在低位，
+               于是一批可能只做 2 次、下一批 5 次、最后一批兜底（如 2/5/3）。
+               再用 cap 夹住上限，保证后面每轮至少还剩 1 次可做。 */
             const avg = n / left;
-            const floorShare = Math.max(1, Math.ceil(avg));
             const factor = this.SHARE_MIN + Math.pow(Math.random(), 1.4) * (this.SHARE_MAX - this.SHARE_MIN);
-            const share = Math.round(avg * factor);
-            const cap = Math.max(2, Math.min(n, Math.ceil(avg * 3)));
-            return Math.max(floorShare, Math.min(share, cap));
+            const share = Math.max(1, Math.round(avg * factor));
+            return Math.max(1, Math.min(share, cap));
         },
 
+        /* gap 已是 startGap()/nextGap() 抽好的实际等待值（含偶发长等待），
+           beat 直接按它等待即可，不再二次抽样 —— 否则会「抽两次」破坏分布。 */
         async beat(gap) {
-            await Utils.delay(this.jitter(gap));
+            await Utils.delay(Math.max(this.FLOOR_MS, Number(gap) || this.FLOOR_MS));
         },
 
         fits(deadline, gap) {
             const d = Number(deadline) || 0;
             if (d <= 0) return true;
-            /* 预留「最大抖动 + 5 秒余量」：抖动改成正负绝对值后，
-               不能再按百分比（gap × 1.35）估，否则小间隔时预留不足。 */
-            return Date.now() + Math.round((Number(gap) || 0) + this.JITTER_MS + 5000) <= d;
+            /* gap 就是本次实际要等的时长，只需再留一点动作+收尾余量。
+               v0.88 起没有 ±15 秒抖动，不再叠 JITTER_MS。 */
+            return Date.now() + Math.round((Number(gap) || 0) + this.GAP_RESERVE_MS) <= d;
         },
         saveGap(ms) {
             GM_setValue("Config.searchGap", { date: Utils.getTodayNum(), ms: Math.round(ms) });
@@ -8678,9 +8682,15 @@ const __scBgKeepAlive = (function() {
             }
             const pointsPerArticle = 3;
             const maxPerDay = 10;
-            const target = Math.min(Math.max(Math.ceil((max - cur) / pointsPerArticle), 1), maxPerDay);
-            Utils.log("📖", `今日还可阅读 ${target} 篇（上限 ${maxPerDay} 篇/天，每篇约 ${pointsPerArticle} 分）`);
-            let gap = SEARCH_PACER.startGap("other");
+            const targetFull = Math.min(Math.max(Math.ceil((max - cur) / pointsPerArticle), 1), maxPerDay);
+            /* v0.88：阅读也按当天剩余执行点分批（用户要求 10 次约分 2 批跑完）。
+               当前点已 used，roundsLeftToday()+1 才是含当前的剩余轮数；
+               每篇间隔走 spanMs（180 秒上限）真随机，与搜索同档。 */
+            const readRoundsLeft = Sched.roundsLeftToday() + 1;
+            const target = SEARCH_PACER.pickShare(targetFull, readRoundsLeft);
+            Utils.log("📖", `今日还需 ${targetFull} 篇，今天剩 ${readRoundsLeft} 个执行点，本轮读 ${target} 篇`
+                + `（上限 ${maxPerDay} 篇/天，每篇约 ${pointsPerArticle} 分，间隔 0~${Math.round(SEARCH_PACER.spanMs() / 1000)} 秒真随机）`);
+            let gap = SEARCH_PACER.startGap();
             /* v0.79：阅读节点独占整个 20 分钟窗口。
                以前这里还叠了个 8 分钟上限，10 篇（每篇一个 otherSpan 节拍）根本读不完，
                每次都「到点交班，还剩 N 篇」—— 一天下来阅读永远差几篇。 */
@@ -8727,7 +8737,7 @@ const __scBgKeepAlive = (function() {
                         Utils.log("🟡", `阅读第 ${i + 1} 篇无新增积分（返回 p:${result.points}，isDuplicate:${result.isDuplicate}）`);
                     }
                 }
-                gap = SEARCH_PACER.nextGap(gap, advanced, "other");
+                gap = SEARCH_PACER.nextGap(gap, advanced);
                 if (cur >= max) {
                     Utils.log("📖", `阅读进度已满（${cur}/${max}），提前结束`);
                     break;
@@ -9014,19 +9024,13 @@ const __scBgKeepAlive = (function() {
             let peakGap = 0;
             let lastStart = 0;
             const needed = Math.max(1, Math.ceil((max - progress) / 3));
-            /* v0.79：节点化之后不再「分散到全天」。
-               用户要求「任务一直做别停、一个节点要么全搜索要么全阅读」——
-               搜索节点会把整个 20 分钟窗口都用来搜索，直到配额满或节点到点；
-               再按「剩余轮数随机分摊 / 可能整轮跳过」就等于自己给自己刹车。
-               Config.spread 保留在面板上只为兼容老配置，节点模式下不生效。 */
-            const spreadOn = false;
-            const roundsLeft = spreadOn ? Sched.roundsLeftToday() : 1;
+            /* v0.88：搜索总量按当天剩余执行点分批，少量多次（用户 2026-11-23 要求）。
+               hitWakePoint 命中当前点时已把它标记 used，所以 roundsLeftToday() 不含当前，
+               +1 才是「含当前在内的剩余轮数」。例：今天 3 个点、当前第 1 个 → left=3，
+               10 次按 pickShare 摊成 ≈2/5/3；18 点后没有未跑点 → left=1 → 全做完兜底。 */
+            const spreadOn = true;
+            const roundsLeft = spreadOn ? (Sched.roundsLeftToday() + 1) : 1;
             const roundTarget = spreadOn ? SEARCH_PACER.pickShare(needed, roundsLeft) : needed;
-            if (spreadOn && roundTarget <= 0) {
-                Utils.log("⏭️", `本轮随机跳过搜索（还差 ${Math.max(0, max - progress)} 分，今天还剩 ${roundsLeft} 轮唤醒，`
-                    + `这一轮的份额让给后面几个时间点）`);
-                return;
-            }
             const attemptCap = Math.min(
                 SEARCH_PACER.MAX_ATTEMPTS,
                 Math.max(8, needed * 2),
@@ -9045,9 +9049,10 @@ const __scBgKeepAlive = (function() {
             const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
 
             Utils.log("🔍", `搜索节点 ${deadlineMin} 分钟（到点交给下一个搜索节点继续，配额不会丢），`
-                + `间隔每次随机 ${Math.round(SEARCH_PACER.cycleMin() / 1000)}~${Math.round(SEARCH_PACER.cycleMax() / 1000)} 秒`
-                + `（基准 ${Math.round(gap / 1000)} 秒，偶尔来一次长停顿），还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`
-                + (spreadOn ? `；今天还剩 ${roundsLeft} 轮唤醒，本轮随机分到 ${roundTarget} 次` : ""));
+                + `间隔每次在 ${Math.round(SEARCH_PACER.cycleMin() / 1000)}~${Math.round(SEARCH_PACER.cycleMax() / 1000)} 秒真随机`
+                + `（${Math.round(SEARCH_PACER.LONG_PAUSE_P * 100)}% 概率 ${Math.round(SEARCH_PACER.LONG_WAIT_MS / 60000)} 分钟长等待），`
+                + `还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`
+                + `；今天剩 ${roundsLeft} 个执行点，本轮分到 ${roundTarget} 次`);
 
             while (attempts < attemptCap && Date.now() < hardDeadline) {
                 /* 每轮搜索前确认这一轮还活着（超时就抛错退出，锁被接管也退出） */
@@ -9097,11 +9102,11 @@ const __scBgKeepAlive = (function() {
                         streakNoCredit = 0;
                         lastCreditAt = Date.now();
                         Utils.log("✅", `记账成功 +${progress - before}（${progress}/${max}）`);
-                        /* 本轮随机份额够了就收手：剩下的留给后面几个唤醒轮，
+                        /* 本轮份额够了就收手：剩下的摊到后面几个执行点，
                            不把一天的量挤在一次里做完。 */
                         if (spreadOn && credits >= roundTarget && progress < max) {
-                            Utils.log("⏸️", `本轮随机份额已达成（记账 ${credits}/${roundTarget} 次，PC ${progress}/${max}），`
-                                + `剩余 ${Math.max(0, max - progress)} 分留到下几轮唤醒`);
+                            Utils.log("⏸️", `本轮份额已达成（记账 ${credits}/${roundTarget} 次，PC ${progress}/${max}），`
+                                + `剩余 ${Math.max(0, max - progress)} 分留到后面的执行点`);
                             break;
                         }
                     } else {
@@ -9151,8 +9156,8 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🟡", `记账核对连续失败 ${verifyFails} 次，本轮结束（已记 ${progress}/${max}），下一轮用真实进度校正`);
                     break;
                 }
-                /* 间隔：每次独立抽样（多数落在 基准×0.6~2.2，10% 概率来一次
-                   3~8 倍长停顿），抽完不知道下一次多长。观察/复核已经花掉 spent，
+                /* 间隔：每次独立抽样（0~上限真随机，10% 概率固定 5 分钟长等待），
+                   抽完不知道下一次多长。观察/复核已经花掉 spent，
                    wait = cycle - spent，所以日志里「等待」比「本次间隔」小是正常的。
                    若抽到的间隔会越过交班点，就直接收手，不睡过点。 */
                 const cycle = SEARCH_PACER.cycle();
@@ -9169,7 +9174,7 @@ const __scBgKeepAlive = (function() {
                 /* 网络慢到 spent 本身超过 cycle 时，下限 3 秒兜底，此时间隔 = spent + 3，
                    日志里如实报出来，不假装还在随机区间内。 */
                 const actual = Math.round((spent + wait) / 1000);
-                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒${isPause ? "（随机长停顿）" : ""}`
+                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒${isPause ? "（5分钟长等待）" : ""}`
                     + `（本次间隔 ${Math.round(cycle / 1000)} 秒，已用 ${(spent / 1000).toFixed(0)} 秒，实测 ${actual} 秒）`);
                 await Utils.delay(wait);
             }
@@ -9195,7 +9200,7 @@ const __scBgKeepAlive = (function() {
                 API.recordSearchRound(attempts, credits, progress, max);
                 Utils.log("🟡",
                     `搜索未满 PC: ${progress}/${max}，本轮 ${attempts} 次搜索、记账 ${credits} 次（${hitRate}%），用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s`
-                    + (spreadOn ? `（本轮随机分到 ${roundTarget} 次，剩余配额继续随机摊到后面几次唤醒）` : "（剩余配额留到下一次定时唤醒）"));
+                    + `（本轮分到 ${roundTarget} 次，剩余配额摊到后面的执行点）`);
                 this.save();
             }
         },
@@ -10665,12 +10670,12 @@ const __scBgKeepAlive = (function() {
         const coolLeft = API.searchCooldownLeft();
         let text = "🔍 PC 搜索诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
-        text += `搜索间隔：每次随机 ${SEARCH_PACER.cycleMin() / 1000} ~ ${SEARCH_PACER.cycleMax() / 1000} 秒（基准 ${pacer.min} 秒，独立抽样，与上一次无关）`
-            + `；另有 ${Math.round(SEARCH_PACER.LONG_PAUSE_P * 100)}% 概率来一次 ${SEARCH_PACER.LONG_PAUSE_MIN}~${SEARCH_PACER.LONG_PAUSE_MAX} 倍长停顿\n`;
-        text += `间隔来源：Config.span = ${pacer.min} 秒（搜索用；最低 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒，配更小会夹到 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒）\n`;
+        text += `搜索/阅读间隔：每次在 ${SEARCH_PACER.cycleMin() / 1000} ~ ${SEARCH_PACER.cycleMax() / 1000} 秒之间真随机（独立抽样，与上一次无关）`
+            + `；另有 ${Math.round(SEARCH_PACER.LONG_PAUSE_P * 100)}% 概率来一次固定 ${SEARCH_PACER.LONG_WAIT_MS / 60000} 分钟长等待\n`;
+        text += `间隔来源：Config.span = ${pacer.min} 秒（搜索/阅读上限；最低 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒，配更小会夹到 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒）\n`;
         text += `间隔自证：日志里的「本次间隔 N 秒」才是间隔；「等待 N 秒」是扣掉观察/复核后的剩余，比间隔小是正常的\n`;
         text += `限流刹车：连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手（间隔本身不再拖慢）\n`;
-        text += `其他任务节拍：Config.otherSpan = ${pacer.other} 秒 ± ${SEARCH_PACER.JITTER_MS / 1000} 秒（阅读/活动卡片/每日活动/国际版活动/二次扫描；最低 ${SEARCH_PACER.OTHER_SPAN_MIN_MS / 1000} 秒）\n`;
+        text += `其他任务节拍：每次在 ${SEARCH_PACER.OTHER_SPAN_MIN_MS / 1000} ~ ${pacer.other} 秒之间真随机（活动卡片/每日活动/国际版活动/二次扫描；${Math.round(SEARCH_PACER.LONG_PAUSE_P * 100)}% 概率 5 分钟长等待）\n`;
         {
             const hc = RewardsAuto.apiConfig.cache;
             const srcName = hc.source === "uapis" ? "uapis.cn 热搜"
@@ -11139,11 +11144,14 @@ const __scBgKeepAlive = (function() {
     const FRESH_STAMP_MS = 30 * 1000;
     /* 判定「上一轮的执行上下文已经死了」的**粗筛**阈值：它每 20 秒刷一次 aliveAt。
        ⚠ 90 秒太紧了。MV3 后台上下文会被 Chrome 冻结，冻结期间 setInterval 跟着停，
-       于是「活着但静默 2 分钟」和「真被回收」长得一模一样。实跑日志（2026-11-22 18:20）
+       于是「活着但静默」和「真被回收」长得一模一样。实跑日志（2026-11-22 18:20）
        里 long 开跑后 18:23 就被判「上下文被销毁」，可它 18:24:39 还在打日志 —— 纯误判，
        代价是清锁清缓存 + 白扔一次补跑额度，还会让新旧两轮抢同一把锁。
-       粗筛放宽到 4 分钟；粗筛命中后还会实测两个心跳周期（runAlive 涨 = 还活着）。 */
-    const RUN_HEARTBEAT_STALE = 4 * 60 * 1000;
+       4 分钟仍不够：阅读节点单次 await 可达 3 分钟（otherSpan=180s 时），叠加一次
+       MV3 冻结就超过 4 分钟。2026-11-23 日志里 marvin 一下午连烧 4 次补跑额度，
+       全是「冻着但活着」被误判。粗筛放宽到 8 分钟；命中后仍要实测三个心跳周期
+       （runAlive 涨 = 还活着），宁可晚几分钟发现真死，也不要误杀正在跑的任务。 */
+    const RUN_HEARTBEAT_STALE = 8 * 60 * 1000;
     const CRON_STALL = 3 * 60 * 1000;
     /* 「跑到一半被打断」的补跑上限：上下文被 CDP 导航顶掉 / 标签页回收时，
        那一轮剩下的任务（活动卡片、连签、阅读、搜索）全部停住，而 tasks 的日期标记
@@ -11158,17 +11166,20 @@ const __scBgKeepAlive = (function() {
        这是「任务确实没做完」的主动加跑，两者互不挤占额度。
        写完 GM 标记后由下一声敲门识别并连跑，做完即撤销，避免无限跑。 */
     const FINALE_CATCHUP_MAX = 3;
-    /* 「心跳」判据：真正在跑的上下文每 20 秒刷一次 aliveAt。
-       超过 RUN_STALE 两个时间都没动，就判定它已经死了。
-       以前只按「开始时间」算且窗口是 40 分钟，于是一轮卡住后
-       每次触发都只打印「上一轮任务还在执行中」，看起来就是永久卡进程。 */
-    const RUN_STALE = 5 * 60 * 1000;
+    /* 「还在忙」判据（isBusy / 重复触发保护）：两个时间都没动超过这个窗口就算不忙。
+       ⚠ 必须和 RUN_HEARTBEAT_STALE（判死）同宽：若它比判死阈值短（原来 5 分钟 vs 8 分钟），
+       冻结到第 5~8 分钟时会出现「没判死、又不算忙」的空档 —— 执行点命中时 ⑦ 的
+       isBusy 让路失效，新上下文直接开跑，和冻着的那轮并行抢同一份任务。 */
+    const RUN_STALE = 8 * 60 * 1000;
     /* 孤儿轮次的宽限期：浏览器重启回来时，上一个上下文的 aliveAt 可能只过去几秒，
        等 3 个心跳周期还不刷新，就说明那是残留而不是真的在跑。 */
     const ORPHAN_GRACE = 45 * 1000;
     /* 运行锁租期：心跳每 20 秒续期一次，正常跑永不过期；
-       中断后最多这么久就会被下一个上下文抢走，不再永久占位。 */
-    const RUN_LOCK_TTL = 6 * 60 * 1000;
+       中断后最多这么久就会被下一个上下文抢走，不再永久占位。
+       ⚠ 必须大于 RUN_HEARTBEAT_STALE（8 分钟）：否则「还没被判死、只是冻着」时
+       锁就先过期，下一声敲门会当成无人持有而直接抢锁，造成两轮并行抢同一份任务。
+       随判死阈值一起从 6 放宽到 10 分钟。 */
+    const RUN_LOCK_TTL = 10 * 60 * 1000;
     const RUN_HEARTBEAT_GAP = 20 * 1000;
     /* 「活着但不动」判据：15 分钟没进展就强制收尾
        （单张卡最长约 8 分钟，不会误伤正常长任务）。 */
@@ -12185,12 +12196,15 @@ const __scBgKeepAlive = (function() {
             return last > 0 && (now - last) > RUN_HEARTBEAT_STALE;
         },
 
-        /* 实测一次「记录里那一轮还活着吗」：等两个心跳周期，看 runAlive 有没有涨。
+        /* 实测一次「记录里那一轮还活着吗」：等三个心跳周期，看 runAlive 有没有涨。
            活着 → 让路；没涨 → 那个上下文已经没了（停用脚本 / 标签页被回收），
            记录作废，本次直接开跑。比只看时间戳可靠：时间戳可能是几秒前刚写的。 */
         async probeOwnerAlive() {
             const before = Number((this.getState() || {}).runAlive) || 0;
-            await Utils.delay(RUN_HEARTBEAT_GAP * 2 + 2000);
+            /* 等三个心跳周期（原两个 = 42 秒）。MV3 冻结期间连 setInterval 都停，
+               两个周期里 runAlive 可能一直不涨，于是「冻着但活着」被当成死。
+               多加一个周期给后台恢复的时间；最多多等 20 秒，换少烧一次补跑额度。 */
+            await Utils.delay(RUN_HEARTBEAT_GAP * 3 + 2000);
             const after = Number((this.getState() || {}).runAlive) || 0;
             return after > before;
         },
@@ -12272,7 +12286,7 @@ const __scBgKeepAlive = (function() {
             /* 上一轮还挂着 running，但它的心跳早就不刷了：可能真的没了，也可能只是
                被 Chrome 冻结了（冻结时 setInterval 一起停）。
                ⚠ 这里只做**粗筛**，不探活、不清锁：这段代码在「每分钟一次的空敲门」
-               里也会走到，而探活要干等两个心跳周期（~42 秒）。之前正是在这里
+               里也会走到，而探活要干等三个心跳周期（~62 秒）。之前正是在这里
                探活 + resetRoundState，把还在跑的那一轮锁清掉、缓存清空，接着报
                「补跑已用满，等下一个执行点」——那一轮的工作就白丢了。
                真死没死，留到确实要用的时候再确认（⑥a' 的补跑判定 / ⑦ 的让路判断）。 */
@@ -12445,13 +12459,13 @@ const __scBgKeepAlive = (function() {
                每天限 RECOVER_MAX_PER_DAY 次，防止上下文反复崩时变成不停重跑。
 
                ⚠ 只在「非执行点的空档」才做，原因有三：
-                 1) 探活要干等两个心跳周期（~42 秒），执行点命中时 ⑦ 本来就会探一次，
+                 1) 探活要干等三个心跳周期（~62 秒），执行点命中时 ⑦ 本来就会探一次，
                     没必要每分钟付一次这个钱；
                  2) 空敲门的结论不该改动运行状态 —— 之前就是在空敲门里判死 + 清锁，
                     把还在跑的那一轮锁清掉，然后报「补跑已用满」；
                  3) 执行点命中时，⑦「上一轮还在跑就让路」的语义才是对的。 */
             if (!peek.hit && ownerDead) {
-                /* 粗筛只是「4 分钟没心跳」，MV3 后台被冻结时同样成立（冻结连
+                /* 粗筛只是「8 分钟没心跳」，MV3 后台被冻结时同样成立（冻结连
                    setInterval 一起停），所以必须实测：runAlive 在涨 = 它还活着。 */
                 try { ownerProbedAlive = await this.probeOwnerAlive(); } catch (_) { ownerProbedAlive = false; }
                 if (ownerProbedAlive) {
@@ -12463,7 +12477,7 @@ const __scBgKeepAlive = (function() {
                     const lastAct1 = Math.max(Number(s1.at) || 0, Number(s1.aliveAt) || 0);
                     if (lastAct1 > 0 && (Date.now() - lastAct1) < 60 * 1000) ownerDead = false;
                 }
-                /* 探活花掉 ~42 秒：后面所有「现在几点」的判断都要用最新时刻，
+                /* 探活花掉 ~62 秒：后面所有「现在几点」的判断都要用最新时刻，
                    否则刚过点的执行点会被漏掉、排程也会算错一档。 */
                 now = Date.now();
                 this.startedAt = now;
@@ -12557,14 +12571,14 @@ const __scBgKeepAlive = (function() {
 
             /* ⑦ 上一轮还没收尾 → 先实测它死没死。
                每分钟都敲门，所以这里只在「真的有到点的执行点」时才付出探活成本；
-               探活要等两个心跳周期，绝不能每分钟做一次。
+               探活要等三个心跳周期，绝不能每分钟做一次。
                停用脚本再马上启用时，上一轮的 running 记录会留在存储里，
                而那个上下文已经不在了；只看时间戳会误判成「还在跑」，然后跳过一整轮。 */
             if (!recover && !finaleCatchup && this.isBusy(now)) {
                 const s = this.getState() || {};
                 let lastAct = Math.max(Number(s.at) || 0, Number(s.aliveAt) || 0);
                 /* ⓪ 快速让路（v0.79）：心跳每 20 秒一次，90 秒内还有活动就一定在跑，
-                   不必付 42 秒探活的代价。节点式执行让一轮变成最长 60 分钟，
+                   不必付 62 秒探活的代价。节点式执行让一轮变成最长 60 分钟，
                    18 点后又是每分钟敲门 —— 不拦这一层，同一轮要被探活十几次，
                    后台 CPU 全耗在「证明自己还活着」上。日志 10 分钟一条，不刷屏。 */
                 if (lastAct > 0 && (now - lastAct) < 90 * 1000) {
@@ -12576,7 +12590,7 @@ const __scBgKeepAlive = (function() {
                     }
                     return { ran: false, reason: "busy" };
                 }
-                /* ① 已经实测过「还活着」的话不用再等 42 秒探一次 */
+                /* ① 已经实测过「还活着」的话不用再等 62 秒探一次 */
                 const alive = ownerProbedAlive === true
                     ? true
                     : await this.probeOwnerAlive().catch(() => false);
