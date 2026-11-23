@@ -241,6 +241,9 @@ RUN_DEADLINE = os.getenv("RUN_DEADLINE", "18:00").strip()
 #   ④ 真的开机太晚，跑到收工就关；允许顺延时也绝不越过当天 0 点（见 RUN_LATE_EXTEND）。
 # 设 0 = 不设门槛（多晚都开机，到点就关）。
 RUN_MIN_SECONDS = int(os.getenv("RUN_MIN_SECONDS", "10800"))
+# 脚本一轮的硬上限（20 分钟预算 + 20 分钟收尾）。收工时刻必须晚于最后一次
+# 「每 20 分钟唤醒」至少这么久，否则那一轮必被掐断 —— 用来在日志里提前预警。
+SCRIPT_ROUND_MIN_SECONDS = int(os.getenv("SCRIPT_ROUND_MIN_SECONDS", "2400"))
 # 启动偏晚（现在距收工不足一轮 RUN_MIN_SECONDS）时怎么办：
 #   1（默认）不再直接放弃启动，也不再死守收工时刻；把收工从「现在」顺延一整轮
 #     （now + RUN_MIN_SECONDS），让脚本猫有足够时间把今天该跑的跑完，跑完再结束。
@@ -296,6 +299,10 @@ PORT_MAP_FILES = [p for p in (
     "/usr/share/novnc/zy-ports.json",
 ) if p]
 _PORT_MAP = {}
+# 本轮实际收工时刻（epoch 毫秒），随端口表一起发给脚本。
+# 脚本靠它接管「运行时段」：容器里开机/收工由本脚本决定，面板的
+# Config.winTime 只是它脱离容器单独用时的兜底。
+_RUN_UNTIL_MS = 0
 _PORT_MAP_TEXT = ""
 _PORT_MAP_LOCK = threading.Lock()
 
@@ -2343,7 +2350,8 @@ def _publish_port_map(account, port, muid="", email=""):
             "port": int(port), "muid": muid or "",
             "email": email or "", "at": now,
         }
-        _PORT_MAP_TEXT = json.dumps({"ts": now, "accounts": _PORT_MAP}, ensure_ascii=False)
+        _PORT_MAP_TEXT = json.dumps({"ts": now, "runUntil": _RUN_UNTIL_MS,
+                                     "accounts": _PORT_MAP}, ensure_ascii=False)
         text = _PORT_MAP_TEXT
     try:
         for path in PORT_MAP_FILES:
@@ -3642,7 +3650,7 @@ def wait_for_run_window(run_seconds: int = 0):
     deadline = _run_deadline(now)
     min_secs = max(0, RUN_MIN_SECONDS)
 
-    def _finish(start_at: datetime, label: str):
+    def _finish(start_at: datetime, label: str, extended: bool = False):
         """统一收尾：等到开机时刻；再保证「开机 → 收工」不少于最短运行时长。
 
         这一步是「任务启动后能跑完」的关键：不管因为什么原因（面板起晚了、
@@ -3670,10 +3678,11 @@ def wait_for_run_window(run_seconds: int = 0):
         dl = deadline
         if dl and min_secs:
             left = (dl - datetime.now()).total_seconds()
-            if left < min_secs:
+            if left < min_secs and not extended:
                 # 收工时间是硬的：到点就关浏览器，绝不为「凑够最短时长」往后拖。
                 # 能走到这里说明开机被拖晚了（面板起晚 / 中途重启 / 窗口特别窄），
-                # 那就跑多少算多少，剩下的明天继续 —— 但 18:00 这条线不动。
+                # 那就跑多少算多少，剩下的明天继续 —— 但收工线不动。
+                # （extended=True 表示上面已经顺延过了，这里再喊「不做顺延」就是自相矛盾）
                 logger.warning(f"⏰ 距收工 {deadline:%H:%M} 只剩 {_fmt_dur(left)}，"
                                f"不足期望的 {_fmt_dur(min_secs)}；按「{deadline:%H:%M} 准点收工」"
                                f"不做顺延，能跑多少算多少")
@@ -3723,6 +3732,7 @@ def wait_for_run_window(run_seconds: int = 0):
             left = (deadline - now).total_seconds() if deadline else 0
             if deadline_rolled:
                 left = 0
+            extended = False
             if min_secs and left < min_secs:
                 # 启动偏晚，距原收工不足一整轮。默认（RUN_LATE_EXTEND=1）不再放弃启动，
                 # 而是把收工时刻从「现在」顺延一整轮：脚本猫按计划文件的 runUntil
@@ -3746,6 +3756,7 @@ def wait_for_run_window(run_seconds: int = 0):
                                        f"（收工上限 {day_end:%H:%M}）→ 今天来不及跑，"
                                        f"本次不启动浏览器")
                         return None
+                    extended = True
                     tail = f"，但今天最多到 {deadline:%H:%M}、不跨 0 点" if capped else ""
                     if deadline_rolled:
                         logger.warning(f"⏰ 当前 {now:%H:%M} 启动偏晚，今天收工点 {old_deadline:%H:%M} 已过，"
@@ -3757,6 +3768,15 @@ def wait_for_run_window(run_seconds: int = 0):
                                        f"不足一轮最短运行时长 {_fmt_dur(min_secs)}。"
                                        f"按「跑完再结束」处理：收工顺延到 {deadline:%H:%M}"
                                        f"（现在起算一整轮{tail}），立即启动浏览器")
+                    # 顺延完也救不回来时把话说明白：脚本一轮的硬上限是
+                    # 20 分钟预算 + 20 分钟收尾，剩余时间不够就必被掐断
+                    # （2026-11-23 23:33 启动那次只剩 25 分钟，实测就是空转）。
+                    left_after = (deadline - now).total_seconds() if deadline else 0
+                    if left_after and left_after < SCRIPT_ROUND_MIN_SECONDS:
+                        logger.warning(f"⏰ 实际可用仅 {_fmt_dur(left_after)}，不足脚本一轮的硬上限 "
+                                       f"{_fmt_dur(SCRIPT_ROUND_MIN_SECONDS)}（20 分钟预算 + 20 分钟收尾）："
+                                       f"即使开跑也大概率跑不完。想稳定跑完请把面板 Cron 调到白天，"
+                                       f"或把收工时间往后延")
                 else:
                     logger.warning(f"⏰ 当前 {now:%H:%M} 不在运行时段 {label} 内，且距收工 "
                                    f"{deadline:%H:%M} 只剩 {_fmt_dur(left)}"
@@ -3769,7 +3789,7 @@ def wait_for_run_window(run_seconds: int = 0):
             else:
                 logger.info(f"⏰ 当前 {now:%H:%M} 不在运行时段 {label} 内，未配收工时间"
                             f"→ 立即启动浏览器")
-            return _finish(now, label)
+            return _finish(now, label, extended=extended)
 
         pool = later_today if (missed in ("auto", "smart") and later_today) \
             else [_window_bounds(now, s, e) for s, e in wins]
@@ -3973,6 +3993,15 @@ def write_run_plan(plan: dict, run_seconds: int, hold: bool = False):
     任务真正开跑之前，不会掐断已经开始的那一轮。
     """
     dl = plan.get("deadline")
+    # 收工时刻同时写进端口表（浏览器一开就发），脚本据此接管运行时段 ——
+    # 否则它只认面板 Config.winTime，顺延到 23:59 的那些轮全被它自己拦掉。
+    global _RUN_UNTIL_MS, _PORT_MAP_TEXT
+    _RUN_UNTIL_MS = int(dl.timestamp() * 1000) if dl else 0
+    if _PORT_MAP:
+        with _PORT_MAP_LOCK:
+            _PORT_MAP_TEXT = json.dumps({"ts": int(time.time() * 1000),
+                                         "runUntil": _RUN_UNTIL_MS,
+                                         "accounts": _PORT_MAP}, ensure_ascii=False)
     data = {
         "date": f"{datetime.now():%Y-%m-%d}",
         "window": plan.get("window") or "",
@@ -3990,6 +4019,7 @@ def write_run_plan(plan: dict, run_seconds: int, hold: bool = False):
     logger.info(f"📋 任务计划：开机 {plan['start_at']:%H:%M}"
                 + (f"，收工 {dl:%H:%M}" if dl else "")
                 + f"；已写入 {len(ok)} 处（{('、'.join(ok)) or '无'}）"
+                + (f"；🕘 已同步给脚本（端口表 runUntil={dl:%H:%M}，脚本不再看面板 winTime）" if dl else "")
                 + (f"；⏸️ 已置「暂缓开跑」（{PLAN_HOLD_TTL} 秒内失效），等版本校准完再放行" if hold else ""))
     # 关键一步：自己挂独立端口的只读接口（不占 GUI 的 8080），脚本猫从这里读
     port = ensure_plan_http(text)

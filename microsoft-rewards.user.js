@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.0.0
+// @version      1.0.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；任务逻辑取自 #8787 v1.5.9，另加多账号 CDP 端口认领、zy.py 日志转发、中文热搜词池
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -1784,6 +1784,11 @@ const __scBgKeepAlive = (function() {
     const PortResolver = {
         _tries: 0,
         _fromTable: false,
+        /* zy.py 在端口表里给的「本轮实际收工时刻」（epoch 毫秒）。
+           容器里作息由 zy.py 决定（开机/收工都可能被顺延到当晚），
+           脚本自己那份 Config.winTime 只是「脱离容器单独用」时的兜底。
+           0 = 没拿到 → 完全按面板 winTime 走，行为与以前一致。 */
+        runUntil: 0,
         /* 认领日志节流：映射稳定后别每轮刷屏，只在「首次 / 映射变化」时打一条；
            失败类按天去重。存 GM 而不是内存，因为 @crontab 每轮都是新后台上下文。 */
         _today() {
@@ -1813,6 +1818,35 @@ const __scBgKeepAlive = (function() {
                 return hit ? String(hit.value) : "";
             } catch (_) { return ""; }
         },
+        /* 抓端口表（含 runUntil）。抽成单独一份是因为「拿运行时段」不需要 MUID：
+           本机 cookie 读不到时照样该知道 zy.py 定的收工时刻。 */
+        async _fetchTable() {
+            for (const url of PORT_TABLE_URLS) {
+                try {
+                    const r = await Utils.xhrFull({ url: url, timeout: 2500, cookie: false });
+                    const txt = String((r && r.text) || "");
+                    if (!txt.trim()) continue;
+                    const t = JSON.parse(txt);
+                    if (!t || typeof t !== "object") continue;
+                    this._noteRunUntil(t);
+                    return { table: t, url: url };
+                } catch (_) { /* 换下一个端口 */ }
+            }
+            return null;
+        },
+        _noteRunUntil(t) {
+            const v = Number(t && t.runUntil) || 0;
+            /* 只接受「未来 26 小时内」的值：过期/离谱的时钟不去信它，
+               免得 zy.py 那边算出脏值把脚本锁在时段外一整天。 */
+            const now = Date.now();
+            this.runUntil = (v > now - 60000 && v < now + 26 * 3600 * 1000) ? v : 0;
+        },
+        /* 只在「按面板配置本来不该跑」时才现抓一次，避免脱离容器单独用时
+           每次唤醒都白等 6 个端口的超时。 */
+        async syncWindow() {
+            try { await this._fetchTable(); } catch (_) {}
+            return this.runUntil;
+        },
         async resolve() {
             if (this._fromTable) return CDP.PORT;
             /* 允许重试：浏览器可能先起来、zy.py 还没发布端口表，
@@ -1825,17 +1859,9 @@ const __scBgKeepAlive = (function() {
                     "认领端口：读不到本机 MUID（GM_cookie 不可用），走兜底端口");
                 return 0;
             }
-            let table = null, hitUrl = "";
-            for (const url of PORT_TABLE_URLS) {
-                try {
-                    const r = await Utils.xhrFull({ url: url, timeout: 4000, cookie: false });
-                    const txt = String((r && r.text) || "");
-                    if (!txt.trim()) continue;
-                    table = JSON.parse(txt);
-                    hitUrl = url;
-                    break;
-                } catch (_) { /* 换下一个端口 */ }
-            }
+            const got = await this._fetchTable();
+            const table = got ? got.table : null;
+            const hitUrl = got ? got.url : "";
             if (!table || !table.accounts) {
                 this._claimLog("no-table:" + this._today(), "🟡",
                     "认领端口：读不到 zy.py 端口表（47831/32/33、8080/81/82 都不通），走兜底端口");
@@ -10677,7 +10703,22 @@ const __scBgKeepAlive = (function() {
             return { start: midnight + cfg.startMin * 60000, end: midnight + cfg.startMin * 60000 + lenMin * 60000 };
         },
 
+        /* zy.py 是否正在接管作息（0 = 没有）。容器里 zy.py 才是「什么时候开机、
+           什么时候收工」的决策者，它可能把收工顺延到当晚（面板 9:00 起晚、
+           手动重启都会这样）；这时若只认面板 winTime，脚本会在 23:00 之后
+           一次次打「🌙 当前不在运行时段」空转，zy.py 却还在等它干活。 */
+        extUntil() {
+            const until = Number(PortResolver.runUntil) || 0;
+            return until > 0 ? until : 0;
+        },
         inWindow(ts) {
+            const t = Number(ts) || Date.now();
+            const until = this.extUntil();
+            if (until && t < until) return true;
+            return this._inWindowCfg(t);
+        },
+        /* 纯面板配置判断（原 inWindow 实现，保持原样） */
+        _inWindowCfg(ts) {
             const t = Number(ts) || Date.now();
             if (this.winCfg().allDay) return true;
             /* 看昨天/今天/明天三个窗口，跨零点的时段也能正确判断 */
@@ -10908,11 +10949,27 @@ const __scBgKeepAlive = (function() {
                 Utils.log("♻️", `清理孤儿运行锁（${this.fmt(orphanLock.ts)} 残留，已超过 ${Math.round(RUN_LOCK_TTL / 60000)} 分钟）`);
             }
 
-            /* ③ 运行时段以面板 Config.winTime 为准：cron 全天唤醒，这里才是闸门。
+            /* ③ 运行时段闸门（cron 全天唤醒，这里才是闸门）。两条来源：
+               · 面板 Config.winTime —— 脱离容器单独用时的兜底；
+               · zy.py 端口表里的 runUntil —— 容器里以它为准。zy.py 会把收工顺延到当晚
+                 （面板起晚、手动重启都会这样），若只认面板，23:00 之后每次唤醒都只打
+                 一行 🌙 空转，而 zy.py 还在等它干活（2026-11-23 23:40 实证）。
+               面板说「不在时段」时才去问一次 zy.py，所以正常路径不多这一次请求。
                时段一结束就把运行痕迹（锁、认领、排期、变体缓存、节流计数）清干净，
                下一次开窗从全新状态开始 —— 定时模式下没有「卡住需要人手动重置」这回事了。
                今日进度（tasks / doneDate / edge / monthly / intl）不清，清了会重复做任务。 */
-            if (!this.inWindow(now)) {
+            const inByCfg = this._inWindowCfg(now);
+            let extUntil = this.extUntil();
+            if (!inByCfg && !extUntil) {
+                try { await PortResolver.syncWindow(); } catch (_) {}
+                extUntil = this.extUntil();
+            }
+            if (!inByCfg && extUntil > now) {
+                Utils.log("🕘", `运行时段由 zy.py 接管：收工 ${new Date(extUntil).toTimeString().slice(0, 5)}`
+                    + "（面板 winTime 本次不生效，容器里作息以 zy.py 为准）");
+            }
+
+            if (!inByCfg && !(extUntil > now)) {
                 const wasInWindow = Number(GM_getValue("Config.windowOpenAt", 0)) > 0;
                 const next = this.alignToWindow(now);
                 this.saveNext(next);
