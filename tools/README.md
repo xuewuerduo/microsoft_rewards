@@ -9,7 +9,7 @@
 
 ```
 .
-├── microsoft-rewards.user.js   ← 脚本源码（@version 是唯一版本来源）
+├── microsoft-rewards.user.js   ← 脚本源码（@version 是唯一版本来源；任务逻辑取自商店 #8787）
 ├── .gitattributes  .gitignore  ← Git 专用文件，必须留在根目录
 └── tools/
     ├── zy.py            容器里的调度器：拉起多账号浏览器、写运行计划、挂日志采集、启动时校准脚本版本
