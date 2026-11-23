@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      0.88
+// @version      0.89
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；已适配 zy 版逻辑（每日随机排程、中文热搜、llq.py 上报、多账号 CDP 端口）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -12292,8 +12292,9 @@ const __scBgKeepAlive = (function() {
                真死没死，留到确实要用的时候再确认（⑥a' 的补跑判定 / ⑦ 的让路判断）。 */
             let ownerProbedAlive = null;      // null=没测 / true=实测还活着
             let ownerDead = this.deadOwner(now);   // 粗筛结果，尚未验证
-            /* 粗筛那一刻「上一轮最后一次动弹」的时刻：后面 ② 的 reapDeadRound 可能先把
-               记录回收掉，等到 ⑥a' 再读就只剩 null，日志会变成「已安静 0 分钟」。 */
+            /* 粗筛那一刻「上一轮最后一次动弹」的时刻：①b/② 的会话重置可能先把记录清掉，
+               等到 ⑥a' 再读就只剩 null，日志会变成「已安静 0 分钟」。
+               v0.89 起 ② 在 ownerDead 为真时不再 reap，这条快照更稳，但保留无妨。 */
             const ownerSnap = this.getState() || {};
             const ownerLastAct = Math.max(Number(ownerSnap.at) || 0, Number(ownerSnap.aliveAt) || 0);
             /* 距上次「敲门」不到 FRESH_STAMP_MS：正常敲门间隔 = cron 周期（60 秒），
@@ -12330,8 +12331,20 @@ const __scBgKeepAlive = (function() {
             }
             GM_setValue("Config.lastSeenDay", todayNum);
 
-            /* ② 回收确实死掉的轮次，清掉超时未开始的认领与孤儿锁 */
-            try { this.reapDeadRound(now); } catch (_) {}
+            /* ② 回收确实死掉的轮次，清掉超时未开始的认领与孤儿锁。
+               ⚠ v0.89：这里原本无条件 reapDeadRound → reap() 只看 max(at,aliveAt)
+               是否超过 RUN_STALE(8 分钟)就回收，完全不探活。MV3 后台被冻结时
+               setInterval 心跳一起停摆，正在跑的轮次（如阅读节点单次 await 可达
+               3 分钟、叠加冻结）同样会"8 分钟没动静"，于是在下一次敲门的第一步
+               就被当成死轮次回收，阅读做到一半被截断、进度白丢。
+               v0.87 加的 probeOwnerAlive 探活在 ⑥a'（下面 ~130 行后），轮到它时
+               running 记录早被这里清成 done，探活根本来不及救。
+               修法：粗筛 ownerDead 为真（疑似上一轮没心跳）时，不在这一步回收，
+               统一交给 ⑥a'「先探活、确实死了才 resetRoundState+补跑」的路径处理。
+               粗筛为假（没挂着 running 或心跳新鲜）时 reap 本来就是 no-op，跳过无副作用。 */
+            if (!ownerDead) {
+                try { this.reapDeadRound(now); } catch (_) {}
+            }
             const staleClaim = this.getClaim();
             if (staleClaim && staleClaim.at && !this.isBusy(now) && now - staleClaim.at > CRON_STALL) {
                 this.clearClaim();
