@@ -7,6 +7,10 @@
 
 只依赖标准库，不需要浏览器、不需要登录 cookie —— webhook URL 本身即凭据。
 """
+
+# 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于核对。
+__version__ = "1.0.3"
+
 import argparse
 import json
 import os
@@ -165,6 +169,7 @@ def cmd_push(args):
 
 def main():
     ap = argparse.ArgumentParser(description="把脚本文件同步到脚本猫商店")
+    ap.add_argument("-V", "--version", action="version", version=f"sc_sync.py {__version__}")
     ap.add_argument("--check", action="store_true", help="对比本地/线上版本")
     ap.add_argument("--push", action="store_true", help="推送更新")
     ap.add_argument("--url", default=os.getenv("SCRIPTCAT_WEBHOOK", ""),

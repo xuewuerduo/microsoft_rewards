@@ -12,6 +12,10 @@
 
 登录态检测：先记下匿名 cookie 名单，出现新 cookie 即认为已登录。
 """
+
+# 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于核对。
+__version__ = "1.0.3"
+
 import argparse
 import json
 import os
@@ -403,6 +407,7 @@ def cmd_dump(args):
 
 def main():
     ap = argparse.ArgumentParser(description="发布脚本到 scriptcat.org")
+    ap.add_argument("-V", "--version", action="version", version=f"sc_pub.py {__version__}")
     ap.add_argument("--login", action="store_true", help="打开窗口登录并保存登录态")
     ap.add_argument("--status", action="store_true", help="看线上/本地版本与登录态")
     ap.add_argument("--dump", action="store_true", help="导出编辑页表单结构（调试）")

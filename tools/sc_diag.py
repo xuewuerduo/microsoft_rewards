@@ -24,6 +24,9 @@ BING_ACCOUNTS 派生）。新增账号只要进了 zy.py，本工具自动就能
 读不到 zy-ports.json 时会明确提示先运行 zy.py，绝不用写死的账号猜测。
 """
 
+# 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于部署核对。
+__version__ = "1.0.3"
+
 import os
 import re
 import sys
@@ -348,6 +351,7 @@ def _self_test():
 
 def main():
     ap = argparse.ArgumentParser(description="账号排程诊断（读脚本猫 IndexedDB 日志）")
+    ap.add_argument("-V", "--version", action="version", version=f"sc_diag.py {__version__}")
     ap.add_argument("--ports", default=None, help="CDP 端口列表，逗号分隔（默认从 zy.py 端口表读取）")
     ap.add_argument("--self-test", action="store_true", help="本机自检（假数据），不连容器")
     args = ap.parse_args()

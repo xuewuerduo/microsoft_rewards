@@ -10,7 +10,7 @@
 // @website      https://scriptcat.org/zh-CN/script-show-page/6006
 // @supportURL   https://scriptcat.org/zh-CN/script-show-page/6006/issue/create
 // @source       https://gitea.zh-cc.top/lilonglong/microsoft_rewards
-// @crontab      */20 * * * *
+// @crontab      */30 * * * *
 // @connect      bing.com
 // @connect      login.live.com
 // @connect      rewards.bing.com
@@ -5261,7 +5261,7 @@ const __scBgKeepAlive = (function() {
             GM_setValue("Config.monthlyState", st);
         },
 
-        /* 同一件事每天只写一条日志：cron 每 20 分钟一轮，不加节流会刷屏。
+        /* 同一件事每天只写一条日志：cron 每 30 分钟一轮，不加节流会刷屏。
            月度计划的进度属于过程状态，**不推送**——完成与否统一由轮末汇总发一条。 */
         monthlyLog(st, icon, msg) {
             const today = Utils.getTodayNum();
@@ -5463,7 +5463,7 @@ const __scBgKeepAlive = (function() {
             }
 
             /* 零请求快速跳过：本轮既没有「今天还能再试」的子项，又还没到下一次复查时间。
-               没有这一步的话，cron 每 20 分钟就会拉一次 earn 页 + quest 详情页，
+               没有这一步的话，cron 每 30 分钟就会拉一次 earn 页 + quest 详情页，
                一个月下来上百次请求，既浪费也更容易被判异常。 */
             const ids = Object.keys(st.quests);
             const unfinished = ids.filter(id => !(st.quests[id] || {}).complete);
@@ -8364,7 +8364,33 @@ const __scBgKeepAlive = (function() {
         }
     };
 
-    const ROUND_BUDGET_MS = 20 * 60 * 1000;
+    /* 带种子的洗牌（FNV-1a → mulberry32 → Fisher-Yates）：种子相同结果必然相同，
+       换种子就重掷。任务打乱用它保证「同账号同轮顺序固定、换账号或换轮就变」，
+       纯函数、不碰 GM 存储。 */
+    const seededShuffle = (arr, seed) => {
+        const out = arr.slice();
+        let h = 2166136261 >>> 0;                    // FNV-1a offset basis
+        const s = String(seed);
+        for (let i = 0; i < s.length; i++) {
+            h ^= s.charCodeAt(i);
+            h = Math.imul(h, 16777619) >>> 0;
+        }
+        let a = h >>> 0;                              // mulberry32 state
+        const rnd = () => {
+            a = (a + 0x6D2B79F5) >>> 0;
+            let t = a;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+        for (let i = out.length - 1; i > 0; i--) {
+            const j = Math.floor(rnd() * (i + 1));
+            const tmp = out[i]; out[i] = out[j]; out[j] = tmp;
+        }
+        return out;
+    };
+
+    const ROUND_BUDGET_MS = 30 * 60 * 1000;
 
     const SEARCH_PACER = {
         /* 节拍：以 Config.span（默认 60 秒）为基准 ±15 秒浮动，按「本次已用掉多少」补齐，
@@ -8526,7 +8552,7 @@ const __scBgKeepAlive = (function() {
             this.hbTimer = setInterval(() => {
                 try { this.heartbeat(); } catch (_) {}
                 /* Edge 连签挂在轮内心跳上：只在「本轮执行」期间上报，
-                   EdgePacer 自按 intervalMin 节流，一轮 20 分钟推进 3~4 次。
+                   EdgePacer 自按 intervalMin 节流，一轮 30 分钟推进 5~6 次。
                    开关关着就别再空转这条链（心跳每 30 秒一次，白跑很吵）。 */
                 if (EdgeStreak.enabled()) {
                     try { EdgePacer.maybeReport().catch(() => {}); } catch (_) {}
@@ -9753,48 +9779,76 @@ const __scBgKeepAlive = (function() {
                 try { await emitStartReport(); } catch (_) {}
                 await withRetry(() => this.doSign(), "签到");
                 await Utils.randomDelay();
-                if (isTokenOK) {
-                    if (RewardsAuto.state.pc401) {
-                        Utils.log("🟡", "PC 会话不可用（只影响 PC 通道任务），阅读改用 App 通道继续执行");
-                    }
-                    await withRetry(() => this.doRead(roundDeadline), "阅读");
-                    await Utils.randomDelay();
-                }
-
-                await this.doDesktopWeekly();
-                await Utils.randomDelay();
-                await withRetry(() => this.doMonthlyPlan(), "月度计划");
-                await Utils.randomDelay();
-                await withRetry(() => this.doPromos(roundDeadline), "活动卡片");
-                await Utils.randomDelay();
-                /* 搜索前加载今日热搜词池（uapis → 热榜接口 → 随机词补足；当天只真拉一次，
-                   之后各轮复用落盘词池，不再打接口）。 */
-                if (Utils.taskOn("Tasks.search")) {
-                    try { await API.prefetchHotWords(); }
-                    catch (e) { Utils.log("🟡", `热搜词准备失败：${e && e.message ? e.message : e}`); }
-                }
-                await withRetry(() => this.doSearch(roundDeadline), "搜索");
-                await withRetry(() => this.doStreak(), "连签检测");
                 const roundExpired = () => Date.now() > roundDeadline;
                 const skipByDeadline = name => Utils.log("🟡", `本轮已到 ${ROUND_BUDGET_MS / 60000} 分钟上限，${name}交给下一轮`);
-                await Utils.randomDelay();
                 let dailySetRes = null;
-                if (roundExpired()) {
-                    skipByDeadline("每日活动");
-                } else {
-                    Utils.log("📅", "开始执行每日活动任务...");
-                    await Utils.randomDelay();
-                    dailySetRes = await withRetry(() => this.doDailySet(roundDeadline), "每日活动");
-                }
-                /* 国际版每日活动：必应面板里那 5 张卡，纯接口完成，不占 CDP 也不开标签页 */
                 let intlDailyRes = null;
-                if (!Utils.taskOn("Tasks.intlDaily")) {
-                    Utils.log("  ", "国际版每日活动已关闭（任务开关）");
-                } else if (roundExpired()) {
-                    skipByDeadline("国际版每日活动");
-                } else {
-                    await Utils.randomDelay();
-                    intlDailyRes = await this.doIntlDaily(roundDeadline);
+
+                /* 8 个互不依赖的任务装箱，按「账号 CDP 端口 + 本轮启动时刻」做种子洗牌：
+                   · 端口不同 → 5 个账号之间顺序不同（不会约而同）
+                   · runningSince 每轮都变 → 同一账号每 30 分钟重新掷一次
+                   签到固定最前，领分/二次扫描/Edge 固定最后，不参与打乱。
+                   每个 run() 自带原来的 randomDelay，节奏与打乱前一致。 */
+                const independentTasks = [
+                    { name: "阅读", run: async () => {
+                        if (!isTokenOK) return;
+                        if (RewardsAuto.state.pc401) {
+                            Utils.log("🟡", "PC 会话不可用（只影响 PC 通道任务），阅读改用 App 通道继续执行");
+                        }
+                        await withRetry(() => this.doRead(roundDeadline), "阅读");
+                        await Utils.randomDelay();
+                    } },
+                    { name: "桌面专属", run: async () => {
+                        await this.doDesktopWeekly();
+                        await Utils.randomDelay();
+                    } },
+                    { name: "月度计划", run: async () => {
+                        await withRetry(() => this.doMonthlyPlan(), "月度计划");
+                        await Utils.randomDelay();
+                    } },
+                    { name: "活动卡片", run: async () => {
+                        await withRetry(() => this.doPromos(roundDeadline), "活动卡片");
+                        await Utils.randomDelay();
+                    } },
+                    { name: "搜索", run: async () => {
+                        /* 搜索前加载今日热搜词池：当天只真拉一次，之后各轮复用落盘词池 */
+                        if (Utils.taskOn("Tasks.search")) {
+                            try { await API.prefetchHotWords(); }
+                            catch (e) { Utils.log("🟡", `热搜词准备失败：${e && e.message ? e.message : e}`); }
+                        }
+                        await withRetry(() => this.doSearch(roundDeadline), "搜索");
+                    } },
+                    { name: "连签检测", run: async () => {
+                        await withRetry(() => this.doStreak(), "连签检测");
+                    } },
+                    { name: "每日活动", run: async () => {
+                        if (roundExpired()) { skipByDeadline("每日活动"); return; }
+                        Utils.log("📅", "开始执行每日活动任务...");
+                        await Utils.randomDelay();
+                        dailySetRes = await withRetry(() => this.doDailySet(roundDeadline), "每日活动");
+                    } },
+                    { name: "国际版每日活动", run: async () => {
+                        /* 必应面板里那 5 张卡，纯接口完成，不占 CDP 也不开标签页 */
+                        if (!Utils.taskOn("Tasks.intlDaily")) {
+                            Utils.log("  ", "国际版每日活动已关闭（任务开关）");
+                            return;
+                        }
+                        if (roundExpired()) { skipByDeadline("国际版每日活动"); return; }
+                        await Utils.randomDelay();
+                        intlDailyRes = await this.doIntlDaily(roundDeadline);
+                    } }
+                ];
+                const orderSeed = `${CDP.PORT}@${this.runningSince}`;
+                const orderedTasks = seededShuffle(independentTasks, orderSeed);
+                Utils.log("🎲", `本轮任务顺序（端口 ${CDP.PORT}）：签到 → ${orderedTasks.map(t => t.name).join(" → ")} → 领分 → 二次扫描 → Edge`);
+                for (const t of orderedTasks) {
+                    if (this.aborted()) break;
+                    try { await t.run(); }
+                    catch (e) {
+                        if (e && e.regionBlocked) throw e;
+                        if (e && e.roundAborted) throw e;
+                        Utils.log("🔴", `${t.name} 执行异常：${e && e.message ? e.message : e}`);
+                    }
                 }
                 try {
                     await this.doClaimPoints();
@@ -9854,7 +9908,7 @@ const __scBgKeepAlive = (function() {
                 }
                 /* CDP 收尾（整轮唯一出口）：把本轮自己开的临时标签页全部关掉。
                    只有「活动卡全清 + 首页待领取也过」才封盘到今天结束；
-                   否则下一轮（可能 20 分钟后）还允许再开一次。 */
+                   否则下一轮（可能 30 分钟后）还允许再开一次。 */
                 try {
                     const closed = await CDP.closeOwned();
                     if (closed > 0) Utils.log("🖱️", `已关闭 ${closed} 个本轮临时标签页`);
@@ -9886,7 +9940,7 @@ const __scBgKeepAlive = (function() {
                    要和 isDayComplete() 共用同一个结论：
                    后者看的是本地标记位（searchDate / edge.complete），
                    而面板可能已经 60/60、Edge 已经 30/30 —— 两套判据不一致，
-                   就会出现「日志说全部完成，却每 20 分钟继续跑」。 */
+                   就会出现「日志说全部完成，却每 30 分钟继续跑」。 */
                 let dayVerified = false;
                 if (info) {
                     const today = RewardsAuto.state.dateNowNum;
@@ -10288,8 +10342,8 @@ const __scBgKeepAlive = (function() {
         } else {
             text += `上一轮：还没有记录\n`;
         }
-        text += `单轮搜索上限：20 分钟（到点交班，剩余配额留到下一次定时唤醒）\n`;
-        text += `整轮墙钟预算：20 分钟（到点不再开新阶段，剩余任务交给下一轮）\n`;
+        text += `单轮搜索上限：${ROUND_BUDGET_MS / 60000} 分钟（到点交班，剩余配额留到下一次定时唤醒）\n`;
+        text += `整轮墙钟预算：${ROUND_BUDGET_MS / 60000} 分钟（到点不再开新阶段，剩余任务交给下一轮）\n`;
         text += `限流计数：${guard.streak}/${SEARCH_GUARD.STREAK_LIMIT}`
             + (coolLeft > 0 ? `（冷却中，约 ${Math.ceil(coolLeft / 60000)} 分钟后自动重试）` : "") + "\n";
         text += `任务标记：${TaskManager.searchDate === RewardsAuto.state.dateNowNum ? "今日已完成" : "今日未完成"}\n\n`;
@@ -10540,24 +10594,25 @@ const __scBgKeepAlive = (function() {
     };
 
     /* ══ 定时（cron）模式 ══
-       @crontab 每 20 分钟唤醒一次，全天 0-23 点：一次唤醒 = 一轮，开跑前随机等 0~5 分钟。
+       @crontab 每 30 分钟唤醒一次，全天 0-23 点：一次唤醒 = 一轮，开跑前随机等 0~5 分钟。
        cron 不能写 9-23 时段（写死在元数据里，面板改了就错位），由脚本按 Config.winTime 判断。
        浏览器关闭时不会触发。 */
-    const CRON_WAKE_MS = 20 * 60 * 1000;
-    const CRON_PERIOD = 20 * 60 * 1000;
-    /* 开跑前随机等 0~5 分钟：只把起跑时刻在 20 分钟槽内后移，
-       两次开跑的间隔仍是 20 分钟（cron 每 20 分钟唤醒一次）。 */
+    const CRON_WAKE_MS = 30 * 60 * 1000;
+    const CRON_PERIOD = 30 * 60 * 1000;
+    /* 开跑前随机等 0~5 分钟：只把起跑时刻在 30 分钟槽内后移，
+       两次开跑的间隔仍是 30 分钟（cron 每 30 分钟唤醒一次）。 */
     const CRON_JITTER = 5 * 60 * 1000;
     const CRON_FIRST_DELAY = 5 * 1000;
-    /* 「脚本没在跑」的判据：cron 每 20 分钟唤醒一次，每次唤醒开头都会写
-       Config.heartbeatAt。所以两次唤醒间隔超过 30 分钟，说明中间至少漏了一次 ——
-       也就是脚本被停用 / 浏览器关过 / 系统休眠。这时清运行痕迹，从头开始。 */
-    const RESUME_GAP = 30 * 60 * 1000;
-    /* @crontab 每 20 分钟一次，正常唤醒只会落在 :00 / :20 / :40 这几分钟上。
+    /* 「脚本没在跑」的判据：cron 每 30 分钟唤醒一次，每次唤醒开头都会写
+       Config.heartbeatAt。所以两次唤醒间隔超过 45 分钟，说明中间至少漏了一次 ——
+       也就是脚本被停用 / 浏览器关过 / 系统休眠。这时清运行痕迹，从头开始。
+       阈值取 1.5 个周期（45min）：30min 正常间隔 + 15min 容差，避免定时器轻微延迟就误判。 */
+    const RESUME_GAP = 45 * 60 * 1000;
+    /* @crontab 每 30 分钟一次，正常唤醒只会落在 :00 / :30 这几分钟上。
        落在其它分钟 = 不是 cron 叫醒的，而是「脚本刚被启用 / 重新加载」时
        立刻跑了一次 —— 这种情况同样要清运行痕迹，否则停用前那一轮的锁会挡住。
-       容忍 3 分钟：浏览器对后台定时器不保证秒级精度。 */
-    const WAKE_GRID_MIN = 20;
+       容忍 2 分钟：浏览器对后台定时器不保证秒级精度。 */
+    const WAKE_GRID_MIN = 30;
     /* 容忍 2 分钟：后台定时器会有轻微延迟，但延迟到 3 分钟以上很罕见；
        就算误判成「新会话」，代价也只是多重置一次运行缓存（今日进度不动）。 */
     const WAKE_GRID_TOLERANCE_MIN = 2;
@@ -10583,8 +10638,9 @@ const __scBgKeepAlive = (function() {
     /* 「活着但不动」判据：15 分钟没进展就强制收尾
        （单张卡最长约 8 分钟，不会误伤正常长任务）。 */
     const ROUND_STALL = 15 * 60 * 1000;
-    /* 单轮硬上限：预算 20 分钟 + 收尾阶段（连签/领奖/Edge），
-       留 20 分钟余量，到点无论卡在哪都由心跳强制收尾。 */
+    /* 单轮硬上限：预算 30 分钟 + 收尾阶段（连签/领奖/Edge），
+       留 20 分钟余量（合计 50 分钟），到点无论卡在哪都由心跳强制收尾。
+       与 zy.py 的 SCRIPT_ROUND_MIN_SECONDS（现 3000 秒）保持一致。 */
     const ROUND_HARD_LIMIT = ROUND_BUDGET_MS + 20 * 60 * 1000;
 
     /* ══ 每日运行窗口 ══
@@ -10744,8 +10800,8 @@ const __scBgKeepAlive = (function() {
 
         saveNext(ts) { GM_setValue("Config.cronNextRun", ts); },
 
-        /* 下一次 cron 唤醒的真实时刻：@crontab 每 20 分钟 → 落在 :00 / :20 / :40。
-           不能写成「现在 + 20 分钟」—— 一轮可能只跑 9 分钟就结束，
+        /* 下一次 cron 唤醒的真实时刻：@crontab 每 30 分钟 → 落在 :00 / :30。
+           不能写成「现在 + 30 分钟」—— 一轮可能只跑 9 分钟就结束，
            那时离下一个刻度可能只有几十秒，日志会骗人。 */
         nextWakeAt(now = Date.now()) {
             const step = CRON_WAKE_MS;
@@ -10808,7 +10864,7 @@ const __scBgKeepAlive = (function() {
         },
 
         /* 一轮结束：清认领、记时间、写「参考排期」供诊断面板显示。
-           定时模式下下一次开跑由 @crontab 决定（20 分钟后），这里不再
+           定时模式下下一次开跑由 @crontab 决定（30 分钟后），这里不再
            参与判断，所以没有 jitter / 冷却改期的逻辑了。 */
         finish(ok, ran = true) {
             const now = Date.now();
@@ -11024,8 +11080,8 @@ const __scBgKeepAlive = (function() {
                 this.resetRoundState("");
             }
 
-            /* ⑦ 随机等 0~5 分钟再开跑：唤醒在整 20 分钟刻度上，
-               起跑错开后实际间隔落在 20~25 分钟，不像定时器那样准点。 */
+            /* ⑦ 随机等 0~5 分钟再开跑：唤醒在整 30 分钟刻度上，
+               起跑错开后实际间隔落在 30~35 分钟，不像定时器那样准点。 */
             const waitMs = Utils.randomRange(0, CRON_JITTER);
             if (waitMs > 5000) {
                 Utils.log("⏳", `定时唤醒：${Math.round(waitMs / 1000)} 秒后开跑（错开整点）`);
@@ -11301,6 +11357,8 @@ const __scBgKeepAlive = (function() {
         text += `当前状态：${Sched.inWindow(now) ? "✅ 在运行时段内" : "🌙 时段外，窗口内不会开新的一轮"}\n`;
         text += `唤醒节拍：每 ${CRON_WAKE_MS / 60000} 分钟一次（@crontab），一次唤醒跑一轮\n`;
         text += `开跑偏移：唤醒后随机等 0~${Math.round(CRON_JITTER / 60000)} 分钟再开跑（错开整点）\n`;
+        text += "任务顺序：签到固定最前、领分/二次扫描/Edge 固定最后；中间 8 项按「账号端口+本轮时刻」打乱，"
+            + "每个账号不同、每 30 分钟重掷（详见每轮的 🎲 日志）\n";
         text += `最近结束：${Sched.fmt(last)}\n`;
         text += `下次 cron 唤醒：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
         text += `上次结束：${last ? Sched.fmt(last) : "无"}（排期记录 ${Sched.fmt(Sched.plan(now))}）\n`;
@@ -11317,7 +11375,7 @@ const __scBgKeepAlive = (function() {
         if (st && st.phase === "running" && !Sched.isBusy(now)) {
             text += `⚠️ 有一条 running 记录已经 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟没动静，下一次调度会自动回收它。\n\n`;
         }
-        text += "定时模式：@crontab 每 20 分钟唤醒一次，醒来看运行时段（面板 Config.winTime），"
+        text += "定时模式：@crontab 每 30 分钟唤醒一次，醒来看运行时段（面板 Config.winTime），"
             + "在时段内就跑一轮，不在就立刻退出。浏览器关闭期间不会唤醒。\n"
             + "「运行阶段」长期停在「正在执行」而最后进展很久没动，说明那一轮卡住了，下一轮会回收它。\n"
             + "想立刻跑一轮：脚本菜单「🚀 立即运行」。";

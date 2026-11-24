@@ -53,6 +53,9 @@ sc_deploy.py — 脚本猫（ScriptCat）扩展 + 商店脚本「一键部署 / 
 依赖：仅 Python 标准库。
 """
 
+# 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于部署核对。
+__version__ = "1.0.3"
+
 import argparse
 import atexit
 import base64
@@ -2409,6 +2412,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="脚本猫扩展 + 商店脚本 一键安装/更新（CDP，无需 GUI）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-V", "--version", action="version", version=f"sc_deploy.py {__version__}")
     ap.add_argument("port_arg", nargs="?", type=int, metavar="PORT",
                     help="单个 CDP 端口（如 9222）")
     ap.add_argument("--port", type=int, help="同位置参数，指定 CDP 端口")

@@ -25,7 +25,7 @@
                         分工：朱雀面板的 Cron 表达式写 `0 0 9 * * *`（每天 9:00 拉起一次），
                           开机时刻由本脚本在 RUN_WINDOW 内随机挑（到点才启动浏览器，
                           等待期间只占一个空闲进程）。真正的签到执行时刻归「脚本猫」：
-                          v1.0.0 起脚本按自己的 @crontab 每 20 分钟唤醒一次，醒来先看
+                          v1.0.0 起脚本按自己的 @crontab 每 30 分钟唤醒一次，醒来先看
                           Config.winTime（默认 09:00~23:00）在不在时段内，在就跑一轮。
                           计划文件仍然会写（含开机/收工时刻，便于排查），但新脚本不再读它。
 可选 RUN_DEADLINE      收工时间（默认取 RUN_WINDOW 末点）：所有任务到此为止，
@@ -33,6 +33,17 @@
                           配了就以配的为准（如 21:30）；
                           ★ 启动偏晚时不再死守这条线，见 RUN_LATE_EXTEND
 可选 RUN_START_RANDOM  是否由本脚本在 RUN_WINDOW 内摇开机时刻（默认 1=摇；0=开窗即跑）
+可选 ACCOUNT_STAGGER_START  账号独立启动（默认 1=开）：面板拉起时刻早于
+                          ACCOUNT_STAGGER_BEFORE_HHMM 时，5 个账号的开机时刻「一把摇好」，
+                          之后各自到点启动自己的浏览器，真正错峰、互不影响（同一天重启沿用）。
+                          设 0 = 始终用旧行为：全账号共用一个开机时刻、同时上线。
+可选 ACCOUNT_STAGGER_BEFORE_HHMM  账号独立启动的生效截止时刻（默认 14:00）：
+                          面板拉起时刻早于此时刻 → 账号独立启动；
+                          到点及之后拉起 → 五个账号一起启动（任务顺序仍由脚本 🎲 随机，不受影响）。
+                          留空 = 全天都启用账号独立启动。
+可选 ACCOUNT_STAGGER_SPREAD_MIN  账号开机时刻散布窗口分钟（默认 180=3 小时）：
+                          5 个账号的时刻一次性摇好、全压在「起点 ~ 起点+该值」内，
+                          再各自按时刻启动（不是串行等前一个跑完）；0=铺满整个可用窗口。
 可选 RUN_WINDOW_MISSED 不在时段内时：auto（默认）只要离收工还够 RUN_MIN_SECONDS 就启动
                           （窗口过完也跑，绝不跨天死等）；wait 等到下一段（含跨天）；skip 直接结束
 可选 RUN_LATE_EXTEND   启动偏晚时是否「跑完再结束」（默认 1=开启）：
@@ -174,6 +185,11 @@ Python 脚本负责：启动前获取热搜词 → 启动浏览器 → 登录检
 旧账号（模板 _template 克隆出来的）已经自带脚本时，这一步只做「确保启用 + 补授权」，不会重复安装。
 """
 
+# 项目版本号：与根目录 microsoft-rewards.user.js 的 @version / CHANGELOG 保持一致。
+# 部署到容器后可用 `python3 zy.py --version` 或看启动日志首行核对是不是同一份。
+# 发版时与 JS @version 一起 bump（当前 1.0.3 为待发版）。
+__version__ = "1.0.3"
+
 import os
 import re
 import json
@@ -264,9 +280,10 @@ RUN_DEADLINE = os.getenv("RUN_DEADLINE", "").strip()
 #   ④ 真的开机太晚，跑到收工就关；允许顺延时也绝不越过当天 0 点（见 RUN_LATE_EXTEND）。
 # 设 0 = 不设门槛（多晚都开机，到点就关）。
 RUN_MIN_SECONDS = int(os.getenv("RUN_MIN_SECONDS", "10800"))
-# 脚本一轮的硬上限（20 分钟预算 + 20 分钟收尾）。收工时刻必须晚于最后一次
-# 「每 20 分钟唤醒」至少这么久，否则那一轮必被掐断 —— 用来在日志里提前预警。
-SCRIPT_ROUND_MIN_SECONDS = int(os.getenv("SCRIPT_ROUND_MIN_SECONDS", "2400"))
+# 脚本一轮的硬上限（30 分钟预算 + 20 分钟收尾 = 50 分钟；脚本侧 ROUND_HARD_LIMIT）。
+# 收工时刻必须晚于最后一次「每 30 分钟唤醒」至少这么久，否则那一轮必被掐断 —— 用来在日志里提前预警。
+# 脚本 2026-11-24 起 cron 由 20 分钟改为 30 分钟、单轮预算 20→30 分钟，这里同步 2400→3000。
+SCRIPT_ROUND_MIN_SECONDS = int(os.getenv("SCRIPT_ROUND_MIN_SECONDS", "3000"))
 # 启动偏晚（现在距收工不足一轮 RUN_MIN_SECONDS）时怎么办：
 #   1（默认）不再直接放弃启动，也不再死守收工时刻；把收工从「现在」顺延一整轮
 #     （now + RUN_MIN_SECONDS），让脚本猫有足够时间把今天该跑的跑完，跑完再结束。
@@ -290,6 +307,22 @@ LAUNCH_CHECK_SECONDS = float(os.getenv("LAUNCH_CHECK_SECONDS", "6"))
 RUN_START_RANDOM = os.getenv("RUN_START_RANDOM", "1").strip().lower() not in ("0", "false", "no", "off")
 # 随机开机时刻落盘（同一天只摇一次，面板重启任务不会重新摇号）
 RUN_START_STATE = os.getenv("RUN_START_STATE", "/app/data/zy-run-start.json")
+# 账号独立启动（默认 1）：面板早于 ACCOUNT_STAGGER_BEFORE_HHMM 拉起 zy.py 时，
+# 5 个账号的开机时刻在 RUN_WINDOW 内「一把摇好」，之后各自到点启动自己的浏览器 ——
+# 五个账号真正错开，而不是串行等前一个跑完再启下一个。
+# 0 = 旧行为：全账号共用一个开机时刻、同时上线。
+# 每个账号的时刻同样落盘（同一天重启沿用，不会重摇）。
+ACCOUNT_STAGGER_START = os.getenv("ACCOUNT_STAGGER_START", "1").strip().lower() not in ("0", "false", "no", "off")
+# 账号独立启动的生效截止时刻（默认 14:00，按面板拉起本脚本的时刻判断）：
+#   拉起时刻 < 该点 → 账号独立启动（各账号摇各自开机时刻，错峰上线）；
+#   拉起时刻 ≥ 该点 → 五个账号一起启动，抢时间把今天任务跑完（任务顺序仍由脚本 🎲 随机）。
+# 留空 = 全天都启用账号独立启动。
+ACCOUNT_STAGGER_BEFORE_HHMM = os.getenv("ACCOUNT_STAGGER_BEFORE_HHMM", "14:00").strip()
+# 账号开机时刻散布窗口（分钟，默认 180=3 小时）：把可用开机区间压到
+# 「最早时刻 ~ 最早时刻+该值」，5 个账号的时刻一次性摇好、全落在这段内，再各自到点启动。
+# 注意这不是「每个账号间隔 3 小时」—— 5 个时刻是在同一段内各自随机分配的。
+# 0 = 不压缩，用整个 [lo, hi] 区间散布（窗口很长时最后账号会很晚才起）。
+ACCOUNT_STAGGER_SPREAD_MIN = int(os.getenv("ACCOUNT_STAGGER_SPREAD_MIN", "180"))
 # 任务计划文件（供「脚本猫」读取：开机时刻 + 收工时刻，它在区间内二次随机执行）
 RUN_PLAN_FILES = ["/app/data/zy-run-plan.json", "/usr/share/novnc/zy-run-plan.json"]
 # 计划读取接口的候选端口：用与 noVNC/GUI 不同的独立端口，彻底避开 8080 上的
@@ -437,15 +470,16 @@ _SCRIPT_START_TS = int(time.time() * 1000)   # 脚本运行开始时刻（baseli
 # 脚本根本没运行时连心跳都发不出，只能由日志采集侧发现「零脚印」。
 ALERT_NO_RUN = os.getenv("ALERT_NO_RUN", "1") in ("1", "true", "yes", "on")
 # 宽限期（分钟）：浏览器启动后多久还没任何脚本日志就告警。
-# 为什么是 40：v1.0.0 起脚本按 @crontab 每 20 分钟唤醒一次，浏览器起来后第一轮
-# 最多要等 20 分钟，再叠加轮内错峰 0~5 分钟，静默上限约 25 分钟 —— 宽限期必须大于它，
-# 否则每个账号第一轮都会误报「脚本未运行」。
-NO_RUN_GRACE_MIN = int(os.getenv("NO_RUN_GRACE_MIN", "40"))
-# 脚本「跑到一半停摆」阈值（分钟）。同样按 20 分钟节拍定：一轮跑满 20 分钟后
-# 到下一轮开跑之间，正常情况下最长静默 ≈ 20 分钟（等 cron）+ 5 分钟（错峰）。
-# 原来 25 分钟是按「每分钟敲门」时代定的，换节拍后会把正常的轮间空窗判成停摆，
-# 触发没必要的修复（reload 扩展会把正在跑的那一轮掐断），所以抬到 40。
-STALL_ALERT_MIN = int(os.getenv("STALL_ALERT_MIN", "40"))
+# 为什么是 50：脚本按 @crontab 每 30 分钟唤醒一次，浏览器起来后第一轮
+# 最多要等 30 分钟，再叠加轮内错峰 0~5 分钟，静默上限约 35 分钟 —— 宽限期必须大于它，
+# 否则每个账号第一轮都会误报「脚本未运行」。原 40 是按 20 分钟节拍定的，换 30 分钟后
+# 只剩 5 分钟余量，后台定时器一延迟就会误报，故抬到 50（留 15 分钟余量）。
+NO_RUN_GRACE_MIN = int(os.getenv("NO_RUN_GRACE_MIN", "50"))
+# 脚本「跑到一半停摆」阈值（分钟）。按 30 分钟节拍定：一轮结束后
+# 到下一轮开跑之间，正常情况下最长静默 ≈ 30 分钟（等 cron）+ 5 分钟（错峰）= 35 分钟。
+# 原来 40 分钟是按 20 分钟节拍定的，换 30 分钟节拍后会把正常的轮间空窗判成停摆，
+# 触发没必要的修复（reload 扩展会把正在跑的那一轮掐断），所以抬到 50。
+STALL_ALERT_MIN = int(os.getenv("STALL_ALERT_MIN", "50"))
 # 复用前校验：浏览器连续运行超过这么多小时就关掉重起。
 # 为什么要有：跨天/上次崩溃残留的浏览器会被「已在运行，沿用」，可它的登录态、
 # 扩展后台、cron 挂载都可能已经烂掉（线上 joe 就是沿用了一个陈旧实例，脚本认领
@@ -463,7 +497,7 @@ SC_CLOSE_ON_DONE = os.getenv("SC_CLOSE_ON_DONE", "1").strip().lower() not in ("0
 # 默认 0 = 关闭这个兜底（不动它，行为与以前一致）。为什么要有：
 #   脚本报不出「全部完成」的账号（桌面任务缺 Chrome、国际版活动没下发 hash、
 #   Cookie 掉登录……）会一直挂到收工 —— 5 个账号就是 5 个常驻 Chromium。
-# 取值要明显大于 STALL_ALERT_MIN（默认 40），否则自动修复还没试完浏览器就被关了。
+# 取值要明显大于 STALL_ALERT_MIN（默认 50），否则自动修复还没试完浏览器就被关了。
 SC_IDLE_CLOSE_MIN = int(os.getenv("SC_IDLE_CLOSE_MIN", "0") or 0)
 # 「有声音但一点没进展」的判定：脚本每轮会打一条汇总（达标 x/y、阅读 a/b、PC a/b、总积分 N），
 # 连续这么多轮读数完全一样 → 判定停滞，先打一次运行情况再关浏览器。默认 3 轮（约 1 小时）。
@@ -910,7 +944,7 @@ _NORUN_LOCK = threading.Lock()
 _ROUND_BUSY = {}
 
 # 脚本「跑到一半彻底停摆」判定：某账号最近一条脚本日志已经过去多少分钟
-# （STALL_ALERT_MIN 统一在文件上方常量区定义，默认 40，按 v1.0.0 的 20 分钟节拍定）
+# （STALL_ALERT_MIN 统一在文件上方常量区定义，默认 50，按 30 分钟节拍定）
 # 停摆后是否尝试自动修复（重新确认脚本已启用 → 必要时 reload 扩展），默认开
 SC_STALL_REPAIR = os.getenv("SC_STALL_REPAIR", "1") in ("1", "true", "yes", "on")
 # 同一账号两次停摆告警/修复之间的最小间隔（分钟），避免把 CDP 打爆
@@ -1038,6 +1072,29 @@ _RE_LEFT = re.compile(r"还差\s*(\d+)\s*项")
 
 _PROGRESS = {}   # name -> {"sig": tuple, "same": int, "at": ts, "text": str}
 
+# 汇总行里「只能等时间/服务端、脚本自己推不动」的缺口项。
+# 实测：账号全部实质任务达标后只剩 Edge 连签待服务端确认（达标 5/6、Edge 0/30），
+# 这种读数连续几轮不变是正常的，若当成停滞会把还在重试的浏览器误关掉（11-24 joe/marvin-1）。
+_WAIT_GAP_KEYS = ("Edge", "月度计划")
+# 这些是「脚本本该能推进」的实质任务；只要其中一个还是 ⏳，就仍是真·停滞候选。
+_ACTIVE_GAP_KEYS = ("阅读", "搜索", "活动卡片", "每日活动", "桌面", "签到", "领取积分")
+
+
+def _waiting_only_gap(line):
+    """本轮汇总的 ⏳ 缺口是否全是「等待型」项（Edge 确认 / 月度按天解锁）。
+
+    脚本用 ↵（或真实换行）分隔各项、项内用 · 连接，所以先按 ↵ 切成一项一项，
+    逐项判断，避免跨项误匹配。任一实质任务还是 ⏳ → 返回 False（照旧可判停滞）；
+    只有全部 ⏳ 项都落在等待型白名单里才返回 True。
+    """
+    items = [s for s in line.replace("\n", "↵").split("↵") if "⏳" in s]
+    if not items:
+        return False
+    for it in items:
+        if any(k in it for k in _ACTIVE_GAP_KEYS):
+            return False
+    return all(any(k in it for k in _WAIT_GAP_KEYS) for it in items)
+
 
 def _parse_round_progress(line):
     """从一条日志里抠本轮进度；不是「本轮汇总」就返回 None。
@@ -1078,7 +1135,7 @@ def _parse_round_progress(line):
     if "goal" not in vals and "total" not in vals:
         return None
     sig = tuple(sorted(vals.items()))
-    return {"sig": sig, "text": " · ".join(bits)}
+    return {"sig": sig, "text": " · ".join(bits), "waiting": _waiting_only_gap(line)}
 
 
 def _note_progress(name, line):
@@ -1095,7 +1152,13 @@ def _note_progress(name, line):
             return
         ent = _PROGRESS.get(name) or {}
         same = int(ent.get("same") or 0)
-        same = same + 1 if ent.get("sig") == parsed["sig"] else 0
+        if parsed["waiting"]:
+            # 缺口只剩「等时间/等服务端确认」的项（Edge 连签 / 月度按天解锁）：
+            # 读数不变是正常的，不是卡住。清零计数，绝不判停滞、不关浏览器。
+            # 否则会把全部实质任务已达标、只差 Edge 确认的账号误伤（11-24 joe/marvin-1）。
+            same = 0
+        else:
+            same = same + 1 if ent.get("sig") == parsed["sig"] else 0
         _PROGRESS[name] = {"sig": parsed["sig"], "same": same,
                            "at": now, "text": parsed["text"]}
         text = parsed["text"]
@@ -2168,7 +2231,7 @@ def _pre_task_calibrate(browsers, plan=None, max_wait=None):
          reload（同路径同 ID，脚本与 Cookie 授权都保留，不重启浏览器、不重开 profile）；
       ③ 扩展一致后继续校准用户脚本版本。
     所以这里既不查 GitHub、也不下 5MB 包 —— 4 个账号只剩「读版本 + 可能 reload」。
-    ⚠️ v1.0.0 起脚本按自己的 @crontab 每 20 分钟唤醒，**不再读计划里的 hold**，
+    ⚠️ v1.0.0 起脚本按自己的 @crontab 每 30 分钟唤醒，**不再读计划里的 hold**，
        「校准期间脚本不会抢先开跑」这条保证已经不存在；改成看脚本的
        「本轮进入执行流程 / 本轮结束」日志判断轮次空窗，最多等 60 秒，
        等不到就照做（最多掐断一轮，20 分钟后 cron 自然重来，任务幂等）。
@@ -2629,8 +2692,10 @@ def _publish_port_map(account, port, muid="", email=""):
     logger.info(f"  🗺️ 端口表已发布：{account} → CDP {port}（MUID {short}）")
 
 
-def _prepublish_port_map(accounts, timeout: float = 30.0):
+def _prepublish_port_map(accounts, timeout: float = 30.0, quiet: bool = False):
     """浏览器都拉起来后，**一次性把全部账号**的「端口 + MUID」发布进端口表。
+
+    quiet=True：账号独立启动时每账号单独调用，不打印批量汇总那行（各账号自己会打）。
 
     为什么要批量预发布：以前端口表是夹在 check_login 里的 —— 页面导航到
     bing 域才发布，而且账号是串行处理的，第 4 个账号要等前 3 个各导航一次才轮到。
@@ -2652,8 +2717,9 @@ def _prepublish_port_map(accounts, timeout: float = 30.0):
         # 免得同一台浏览器在端口表里出现两个名字，排查时对不上。
         targets.append((os.path.basename(user_dir.rstrip("/")) or acc["name"],
                         user_dir, port, acc.get("email") or ""))
-    if len(targets) < 2:
-        return 0        # 单账号没有串号风险，省掉这一次 CDP 往返
+    if len(targets) < 2 and not quiet:
+        return 0        # 全量模式单账号没有串号风险，省掉这一次 CDP 往返；
+                        # quiet=账号独立启动逐账号调用，必须发（否则端口表一直是空的）
 
     def _one(item):
         name, user_dir, port, email = item
@@ -2680,8 +2746,9 @@ def _prepublish_port_map(accounts, timeout: float = 30.0):
             if muid:
                 ok += 1
     # 成功也打一行汇总：这是「四账号端口有没有一次发全」的唯一判据
-    logger.info(f"  🗺️ 端口表批量预发布完成：{ok}/{len(targets)} 个账号"
-                + ("" if ok == len(targets) else "（其余由登录检查兜底补发）"))
+    if not quiet:
+        logger.info(f"  🗺️ 端口表批量预发布完成：{ok}/{len(targets)} 个账号"
+                    + ("" if ok == len(targets) else "（其余由登录检查兜底补发）"))
     return ok
 
 
@@ -3893,25 +3960,61 @@ def _save_start_state(st: dict):
         logger.warning(f"  ⚠️ 写入随机开机时刻失败（{RUN_START_STATE}）: {e}")
 
 
-def _pick_start_at(lo: datetime, hi: datetime) -> datetime:
-    """在 [lo, hi] 里随机挑开机时刻；同一天摇过就沿用落盘的那个"""
+def _pick_start_at(lo: datetime, hi: datetime, account: str = "") -> datetime:
+    """在 [lo, hi] 里随机挑开机时刻；同一天、同一账号摇过就沿用落盘的那个。
+
+    account 留空 = 旧的「全账号共用一个开机时刻」，存在 rec["startAt"]（向后兼容）；
+    传账号名 = 账号独立启动，存在 rec["accounts"][account]，各账号互不影响。
+    落盘格式：{日期: {"startAt": 全局时刻, "accounts": {账号: 各自时刻}, "picked": ...}}
+    """
     dkey = f"{lo:%Y-%m-%d}"
     st = _load_start_state()
     rec = st.get(dkey)
-    if isinstance(rec, dict) and rec.get("startAt"):
+    if not isinstance(rec, dict):
+        rec = {}
+    if account:
+        key_path = rec.get("accounts")
+        saved = key_path.get(account) if isinstance(key_path, dict) else None
+    else:
+        saved = rec.get("startAt")
+    if saved:
         try:
-            t = datetime.fromisoformat(rec["startAt"])
+            t = datetime.fromisoformat(saved)
             if lo <= t <= hi:                     # 仍在今天的可用区间内
-                logger.info(f"⏰ 沿用今天已摇出的开机时刻 {t:%H:%M}（面板重启不会重新摇号）")
+                who = f"账号 {account} " if account else ""
+                logger.info(f"⏰ 沿用今天已摇出的{who}开机时刻 {t:%H:%M}（面板重启不会重新摇号）")
                 return t
         except Exception:
             pass
     span = max(0, int((hi - lo).total_seconds()))
     t = lo + timedelta(seconds=random.randint(0, span))
-    st[dkey] = {"startAt": t.isoformat(timespec="seconds"),
-                "picked": f"{datetime.now():%Y-%m-%d %H:%M:%S}"}
+    if account:
+        accounts_map = dict(rec.get("accounts") or {})
+        accounts_map[account] = t.isoformat(timespec="seconds")
+        rec["accounts"] = accounts_map
+    else:
+        rec["startAt"] = t.isoformat(timespec="seconds")
+    rec["picked"] = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+    st[dkey] = rec
     _save_start_state(st)
     return t
+
+
+def _wait_until_dt(target: datetime, label: str = ""):
+    """阻塞等到 target 时刻；分段睡以便面板 SIGTERM 能及时中断，等待期间打心跳。
+
+    账号独立启动时用它把每个账号「卡」到自己的开机时刻再启动浏览器。
+    """
+    last_log = 0.0
+    while True:
+        remain = (target - datetime.now()).total_seconds()
+        if remain <= 0:
+            return
+        now_ts = time.time()
+        if now_ts - last_log >= RUN_WAIT_LOG_SECONDS:
+            logger.info(f"  ⏳ {label} 计划 {target:%H:%M} 启动，还有 {_fmt_dur(remain)}")
+            last_log = now_ts
+        time.sleep(min(remain, 30))
 
 
 def wait_for_run_window(run_seconds: int = 0):
@@ -3935,8 +4038,10 @@ def wait_for_run_window(run_seconds: int = 0):
     deadline = _run_deadline(now)
     min_secs = max(0, RUN_MIN_SECONDS)
 
-    def _finish(start_at: datetime, label: str, extended: bool = False):
+    def _finish(start_at: datetime, label: str, extended: bool = False, bounds=None):
         """统一收尾：等到开机时刻；再保证「开机 → 收工」不少于最短运行时长。
+
+        bounds=(lo, hi) 是账号独立启动时要用的摇号区间，回带给主流程。
 
         这一步是「任务启动后能跑完」的关键：不管因为什么原因（面板起晚了、
         手动重启、摇号摇到窗口末尾）导致开机时刻很晚，都不会出现
@@ -3971,7 +4076,8 @@ def wait_for_run_window(run_seconds: int = 0):
                 logger.warning(f"⏰ 距收工 {deadline:%H:%M} 只剩 {_fmt_dur(left)}，"
                                f"不足期望的 {_fmt_dur(min_secs)}；按「{deadline:%H:%M} 准点收工」"
                                f"不做顺延，能跑多少算多少")
-        return {"window": label, "start_at": start_at, "deadline": dl}
+        # bounds=(lo, hi) 回带给主流程：账号独立启动时要用同一段区间给每个账号分别摇号。
+        return {"window": label, "start_at": start_at, "deadline": dl, "bounds": bounds}
 
     wins = parse_run_windows(RUN_WINDOW)
     if not wins:
@@ -4054,12 +4160,12 @@ def wait_for_run_window(run_seconds: int = 0):
                                        f"按「跑完再结束」处理：收工顺延到 {deadline:%H:%M}"
                                        f"（现在起算一整轮{tail}），立即启动浏览器")
                     # 顺延完也救不回来时把话说明白：脚本一轮的硬上限是
-                    # 20 分钟预算 + 20 分钟收尾，剩余时间不够就必被掐断
+                    # 30 分钟预算 + 20 分钟收尾 = 50 分钟，剩余时间不够就必被掐断
                     # （2026-11-23 23:33 启动那次只剩 25 分钟，实测就是空转）。
                     left_after = (deadline - now).total_seconds() if deadline else 0
                     if left_after and left_after < SCRIPT_ROUND_MIN_SECONDS:
                         logger.warning(f"⏰ 实际可用仅 {_fmt_dur(left_after)}，不足脚本一轮的硬上限 "
-                                       f"{_fmt_dur(SCRIPT_ROUND_MIN_SECONDS)}（20 分钟预算 + 20 分钟收尾）："
+                                       f"{_fmt_dur(SCRIPT_ROUND_MIN_SECONDS)}（30 分钟预算 + 20 分钟收尾）："
                                        f"即使开跑也大概率跑不完。想稳定跑完请把面板 Cron 调到白天，"
                                        f"或把收工时间往后延")
                 else:
@@ -4089,6 +4195,28 @@ def wait_for_run_window(run_seconds: int = 0):
         hi = min(hi, deadline - timedelta(seconds=min_secs))
     if deadline and hi > deadline:
         hi = deadline
+    # 账号独立启动的门控：按「面板拉起本脚本的时刻」(now) 判断，而不是摇出的开机时刻。
+    #   拉起 < ACCOUNT_STAGGER_BEFORE_HHMM（默认 14:00）→ 账号独立启动；
+    #   拉起 ≥ 该点 → 回退为全账号共用一个开机时刻、一起启动。
+    stagger_cut = _hhmm_to_min(ACCOUNT_STAGGER_BEFORE_HHMM)
+    now_min_local = now.hour * 60 + now.minute
+    stagger_allowed = (ACCOUNT_STAGGER_START and hi > lo and
+                       (stagger_cut is None or now_min_local < stagger_cut))
+    if stagger_allowed:
+        # 账号独立启动：这里不摇全局开机时刻，把 [lo, hi] 区间回带给主流程，
+        # 由主流程给每个账号「一把摇好」各自的开机时刻、到点单独启动该账号的浏览器。
+        # lo 已经保证「现在/窗口起点」，最晚账号也不会晚于 hi（已扣掉最短运行时长）。
+        spread_hi = (min(hi, lo + timedelta(minutes=ACCOUNT_STAGGER_SPREAD_MIN))
+                     if ACCOUNT_STAGGER_SPREAD_MIN > 0 else hi)
+        when = "全天启用账号独立启动" if stagger_cut is None \
+            else f"拉起 {now:%H:%M} 早于 {ACCOUNT_STAGGER_BEFORE_HHMM}"
+        logger.info(f"⏰ 运行时段 {label}，{when} → 账号独立启动：5 个账号开机时刻一把摇好，"
+                    f"集中在 {lo:%H:%M}~{spread_hi:%H:%M} 内分别随机（到点各启各的浏览器）")
+        return _finish(lo, label, bounds=(lo, hi))
+    if ACCOUNT_STAGGER_START and hi > lo and stagger_cut is not None \
+            and now_min_local >= stagger_cut:
+        logger.info(f"⏰ 运行时段 {label}，拉起 {now:%H:%M} 已到/晚于 {ACCOUNT_STAGGER_BEFORE_HHMM}"
+                    f" → 五个账号一起启动（任务顺序仍由脚本 🎲 随机，本脚本不干预）")
     if not RUN_START_RANDOM or hi <= lo:
         start_at = lo
         if start_at > now:
@@ -4318,7 +4446,7 @@ def set_plan_hold(hold: bool, ttl: int = 0):
     """改写计划里的「暂缓开跑」标记（校准前拦一下，校准完立刻放行）。
 
     只改这一个字段并重写同一份计划，不动开机/收工时刻，所以脚本侧的排程不会因此重算。
-    ⚠️ v1.0.0 起脚本按自己的 @crontab 每 20 分钟唤醒、不再读计划，
+    ⚠️ v1.0.0 起脚本按自己的 @crontab 每 30 分钟唤醒、不再读计划，
        所以 hold 对新脚本**无效**，保留只为「回退到 v0.90 及更早」时还能拦一下。
     """
     data = dict(_PLAN_LAST)
@@ -4359,6 +4487,7 @@ def main():
 
     signal.signal(signal.SIGTERM, _on_terminate)
 
+    logger.info(f"🚀 微软积分任务 zy.py v{__version__} 启动")
     logger.info("⚙️  任务配置:")
     _rs_raw = os.getenv("BING_RUN_SECONDS", "")
     logger.info(f"  BING_RUN_SECONDS = {run_seconds}"
@@ -4426,7 +4555,7 @@ def main():
     # 开工判定：面板每天 9:00 只拉起本脚本一次，开机时刻由这里在 RUN_WINDOW
     # （默认 09:00-15:00）内随机挑；没到点就等，等待期间只占一个空闲进程，
     # 浏览器不启动。真正的签到执行时刻归「脚本猫」自己：v1.0.0 起它按 @crontab
-    # 每 20 分钟唤醒、按 Config.winTime 判断时段，不再读这份计划的执行时刻。
+    # 每 30 分钟唤醒、按 Config.winTime 判断时段，不再读这份计划的执行时刻。
     plan = wait_for_run_window(run_seconds)
     if plan is None:
         logger.info("本次不启动浏览器（原因见上方 ⏰ 日志），任务结束")
@@ -4435,6 +4564,25 @@ def main():
     run_seconds = _clamp_run_seconds(run_seconds, plan)
     if run_seconds < 0:
         return
+
+    # ── 账号独立启动：给每个账号摇各自的开机时刻 ──
+    # plan["bounds"] 由 wait_for_run_window 在账号独立模式下回填，是已经扣掉
+    # 最短运行时长、不会越过收工的区间 [lo, hi]。同一天同一账号摇过就沿用。
+    acct_starts = {}       # name -> datetime；空 = 旧行为（全账号同时启动）
+    if ACCOUNT_STAGGER_START and plan.get("bounds") and len(accounts) > 1:
+        slo, shi = plan["bounds"]
+        # 可选散布上限：把区间压到开局后的一段，避免窗口很长时末位账号拖到很晚
+        if ACCOUNT_STAGGER_SPREAD_MIN > 0:
+            shi = min(shi, slo + timedelta(minutes=ACCOUNT_STAGGER_SPREAD_MIN))
+        for acc in accounts:
+            acct_starts[acc["name"]] = _pick_start_at(slo, shi, account=acc["name"])
+        logger.info("🗓️ 账号独立启动时刻表（各账号到点各自启动浏览器，互不影响）：")
+        for _n in sorted(acct_starts, key=lambda k: acct_starts[k]):
+            logger.info(f"   🕘 {_n:<10} {acct_starts[_n]:%H:%M}")
+        # 计划文件里的开机时刻仍写最早账号的时刻，供排查；脚本不读它
+        plan["start_at"] = min(acct_starts.values())
+
+    # 计划文件在所有账号开机时刻都定好后一次性写出（hold=校准期间暂缓开跑）
     write_run_plan(plan, run_seconds, hold=bool(SC_AUTO_UPDATE or SC_EXT_UPDATE))
 
     # 启动浏览器前先获取热搜词写入文件（供「脚本猫-微软积分商城签到脚本」读取）
@@ -4460,11 +4608,15 @@ def main():
         logger.info(f"🧩 开浏览器前的本地扩展版本：v{_prep.get('after') or _prep.get('before') or '?'}"
                     f"（线上最新 v{_prep.get('latest') or '未取到'}）")
 
-    # —— 四账号同时上线 ——
-    # 先并发把所有账号的浏览器拉起来（几秒内全部就绪），再逐个做登录检查。
-    # 串行「启动→就绪→查登录→下一个」会让后面的账号晚几分钟才上线，
-    # 而执行点是四账号共用的，晚到的账号会错过第一个执行点、整天少跑一轮。
-    if HEADLESS_MODE != "gui":
+    # —— 上线方式：账号独立启动 vs 全部同时上线 ——
+    # 账号独立模式：不能在这里一次性把所有浏览器拉起来（那就又同时上线了），
+    # 改为在下面的逐个账号循环里，各账号等到自己的开机时刻再单独启动。
+    # 端口表也不再批量预发布（那时其它浏览器还没起），改由每个账号启动后自己发布。
+    # 旧模式仍走原来的并发预启动 + 批量端口表，行为完全不变。
+    if not acct_starts and HEADLESS_MODE != "gui":
+        # 先并发把所有账号的浏览器拉起来（几秒内全部就绪），再逐个做登录检查。
+        # 串行「启动→就绪→查登录→下一个」会让后面的账号晚几分钟才上线，
+        # 而执行点是四账号共用的，晚到的账号会错过第一个执行点、整天少跑一轮。
         try:
             prelaunch_accounts(accounts)
         except Exception as e:
@@ -4486,6 +4638,12 @@ def main():
         user_dir = os.path.join(CHROME_USER_DATA_BASE, f"user-{name}")
         port = CDP_BASE_PORT + i if CDP_BASE_PORT else 0
         Path(user_dir).mkdir(parents=True, exist_ok=True)
+
+        # 账号独立启动：等到本账号的开机时刻再启动它的浏览器。
+        # 早到点的账号先起来干活，晚的继续等，彼此完全错开。
+        if acct_starts.get(name):
+            _wait_until_dt(acct_starts[name], f"账号 {name}")
+            logger.info(f"⏰ 账号 {name} 到达独立开机时刻 {acct_starts[name]:%H:%M}，开始启动浏览器")
 
         pid = get_running_pid(user_dir)
         if pid and HEADLESS_MODE == "gui":
@@ -4613,6 +4771,15 @@ def main():
         #    （_prepare_ext_bundle），这里每个账号只做「装好/启用/授权」。
         #    「浏览器已装版本 vs 本地目录版本」统一放到开跑前校准里做（_pre_task_calibrate），
         #    顺序就是：扩展对齐 → 检查脚本更新 → 放行任务。放在这里比只会让日志多打一遍。
+
+        # 账号独立启动：本账号刚上线，抢在脚本猫第一次 cron 敲门（:00/:20/:40）之前
+        # 先把自己的「端口 + MUID」发布进端口表，避免认领失败回退 9222 串到别的账号。
+        # 只读本地 cookie 不导航，几秒出结果；check_login 到 bing 域后还会再兜底发一次。
+        if acct_starts.get(name) and port:
+            try:
+                _prepublish_port_map([acc], quiet=True)
+            except Exception as e:
+                logger.warning(f"  ⚠️ 账号 {name} 端口表发布失败（登录检查会兜底补发）: {e}")
 
         # 登录判断：rewards.bing.com + email 比对
         result = {"ok": None, "matched": False, "reason": "CDP 未开启，跳过登录检查", "current_email": None}
@@ -5043,9 +5210,14 @@ if __name__ == "__main__":
     #   python3 zy.py --install-script   给所有账号重新安装/修复扩展 + 脚本
     #   python3 zy.py --script-status    只看各账号脚本版本
     _argv = sys.argv[1:]
+    if any(a in ("-V", "--version") for a in _argv):
+        print(f"zy.py {__version__}")
+        sys.exit(0)
     if any(a in ("-h", "--help") for a in _argv):
-        print("用法: python3 zy.py [--update-script | --update-ext | --install-script | --script-status]\n"
+        print(f"用法: python3 zy.py [--version | --update-script | --update-ext | --install-script | --script-status]\n"
+              f"  （zy.py v{__version__}，与脚本 @version 同步）\n"
               "  不带参数            正常执行面板任务（启动浏览器→登录检查→运行脚本→收工）\n"
+              "  -V, --version       打印版本号后退出（部署后核对用）\n"
               "  --update-script     手动把签到脚本更新到商店最新版（浏览器没在跑会临时拉起）\n"
               "  --update-ext        手动把脚本猫扩展插件更新到最新（磁盘新版/商店）\n"
               "  --install-script    重新安装/修复脚本猫扩展 + 脚本 + Cookie 授权\n"

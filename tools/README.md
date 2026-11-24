@@ -89,7 +89,10 @@ python tools/sc_sync.py --push --dry --url <webhook地址>   # 演练，不提�
 
 ## 版本约定
 
-- `microsoft-rewards.user.js` 头部 `@version` 是唯一版本号，改代码必须同时改它，否则商店不会生成新版本。
+- `microsoft-rewards.user.js` 头部 `@version` 是**脚本发版号**：改脚本本体必须同时改它，否则商店不会生成新版本。
+- 5 个 py 脚本各有 `__version__` 常量（zy / sc_deploy / sc_diag / sc_sync / sc_pub），**与上面的 `@version` 同步**。
+  它们是"待发版号"——比如脚本 @version 还没 bump、但 py 已含新改动时，py 会先标到下一版（当前统一 `1.0.3`，CHANGELOG 里对应节标注【待发版】）。发版时把脚本 @version bump 到同一值即可全项目对齐。
+- 容器里核对版本：`python3 zy.py --version`（其余 4 个脚本同样支持 `-V/--version`），或看 zy.py 启动日志首行的 `🚀 … vX`。作为库 import 时读 `模块.__version__`。
 - 线上比本地新时不要强推（`--force` 只在需要覆盖时用）。
 
 ## 授权说明
