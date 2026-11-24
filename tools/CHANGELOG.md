@@ -12,11 +12,11 @@
 
 ---
 
-## v1.0.3 · 2026-11-24（脚本 + zy.py：cron 20→30 分钟，维持产能的完整联动改动）【待发版】
+## v1.0.3 · 2026-11-24（脚本 + zy.py：cron 20→30 分钟，维持产能的完整联动改动）
 
-> ⚠️ 本节改动**尚未 bump `@version`、未发商店、未部署**。脚本本体当前仍是 `@version 1.0.1`（11416 行，md5 `0de833c9`）；发版时把 `@version` 改为 `1.0.3`。zy.py 5252 行，md5 `1b3f0086`。
+> ⚠️ 代码已改完并提交推送，但**未发商店、未部署容器**。脚本本体 `@version 1.0.3`（11416 行，md5 `2d967463`），zy.py 5263 行，md5 `47de26ec`。
 >
-> **补充（同属 v1.0.3）**：5 个 py 脚本统一加 `__version__ = "1.0.3"`（待发版号，与本节对齐）。zy.py 启动日志首行打印版本、`--version/-V` 可查；sc_deploy/sc_diag/sc_sync/sc_pub 均支持 `--version/-V`。发版时脚本 @version bump 到 1.0.3 即全项目对齐。`tools/README.md` 的「版本约定」同步更新。
+> **版本号已全项目对齐**：脚本 `@version` 与 5 个 py 脚本的 `__version__ = "1.0.3"`、本节版本号三者一致。zy.py 启动日志首行打印版本、`--version/-V` 可查；sc_deploy/sc_diag/sc_sync/sc_pub 均支持 `--version/-V`。`tools/README.md` 的「版本约定」同步更新。
 
 - **改了什么**（这是联动改动，漏改任何一处都会出 bug 或掉产能）：
   - **脚本本体** `microsoft-rewards.user.js`：
