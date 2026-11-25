@@ -25,7 +25,7 @@ BING_ACCOUNTS 派生）。新增账号只要进了 zy.py，本工具自动就能
 """
 
 # 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于部署核对。
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 
 import os
 import re

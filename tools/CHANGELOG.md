@@ -12,6 +12,29 @@
 
 ---
 
+## v1.0.9 · 2026-11-25（仅脚本：搜索与阅读/卡片拆成两套节拍）
+
+- **改了什么**（`microsoft-rewards.user.js`，5 个 py 仅版本号对齐）：
+  - 新增配置 `Config.readSpan`：**阅读/卡片间隔**，默认 90、最低 60、可调大。
+  - `SEARCH_PACER` 新增 `READ_MIN_MS`（60s）、`readSpanMs()`、`readGap()`。
+  - 侧任务（阅读 `doRead`、活动卡片 `doPromos`、每日活动 `doDailySet`、二次扫描、
+    国际版卡片 `IntlDaily.run` / `doIntlDaily`）的 `startGap()` / `nextGap()` 全部换成 `readGap()`；
+    搜索 `doSearch` 仍走 `startGap()`（180 秒）。
+  - 诊断面板「阅读/卡片节拍」一行改为显示独立基准与配置项名。
+- **为什么**：v1.0.8 把搜索抬到 3 分钟后，阅读和卡片因为共用同一个 `SEARCH_PACER`
+  也被拖成 3 分钟一张 —— 单轮 8 分钟阅读预算只够读 2~3 篇，读满 10 篇要拖好几轮。
+  搜索放慢是为了防风控，阅读/卡片本来就是低频操作，不需要跟着慢。
+- **影响**：搜索仍 165~195 秒；阅读/卡片回到 75~105 秒，单轮能读完的量恢复。
+  两套节拍独立取配置，互不影响。
+- **影响文件**：`microsoft-rewards.user.js`、5 个 py（仅版本号）、`tools/CHANGELOG.md`、
+  `tools/release-notes/v1.0.9.md`。
+- **怎么验证**：
+  1. `node --check` 通过；`grep startGap()` 只剩 `doSearch` 一处调用。
+  2. 单测：默认 180/90；`span=60` 夹到 180、`span=300` 保持；`readSpan=30` 夹到 60、
+     `readSpan=240` 保持且不影响搜索；90 秒抖动实测 75~105；`fits` 余量判定正确。
+  3. 诊断面板：搜索间隔 ≈180 秒，阅读/卡片节拍 ≈90 秒。
+- **生效步骤**：`git push origin main`；各账号下次 `zy.py` 启动校准拉到 1.0.9。
+
 ## v1.0.8 · 2026-11-25（仅脚本：搜索间隔下限 90 秒 → 3 分钟）
 
 - **改了什么**（`microsoft-rewards.user.js`，5 个 py 仅版本号对齐）：

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.0.8
+// @version      1.0.9
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；任务逻辑取自 #8787 v1.5.9，另加多账号 CDP 端口认领、zy.py 日志转发、中文热搜词池
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -73,6 +73,12 @@ Config:
         type: number
         default: 180
         min: 180
+        unit: 秒
+    readSpan:
+        title: 阅读/卡片间隔(最低 60，默认 90；只影响阅读、活动卡片，与搜索间隔独立)
+        type: number
+        default: 90
+        min: 60
         unit: 秒
     winTime:
         title: 运行时段(格式 开始-结束，如 09:00-23:00；前后时间相同则全天不限)
@@ -7780,8 +7786,8 @@ const __scBgKeepAlive = (function() {
                之前一张卡失败能刷 6 行（每种形态各一行），完全没法看。 */
             const failed = [];
             const pacer = (typeof SEARCH_PACER !== "undefined") ? SEARCH_PACER : null;
-            /* 节拍基准：没传就按 Config.span（最低 180 秒）走，绝不定死成几秒 */
-            let beatGap = Number(gap) > 0 ? Number(gap) : (pacer ? pacer.startGap() : 60 * 1000);
+            /* 节拍基准：没传就按侧任务节拍 Config.readSpan（默认 90 秒）走，绝不定死成几秒 */
+            let beatGap = Number(gap) > 0 ? Number(gap) : (pacer ? pacer.readGap() : 90 * 1000);
             let outOfTime = false;
             let idx = 0;
             for (const card of todo) {
@@ -7818,11 +7824,11 @@ const __scBgKeepAlive = (function() {
                 } else {
                     failed.push({ name, reason: lastReason });
                 }
-                /* 卡片间隔 = 与搜索/阅读同一套节拍（Config.span，最低 180 秒）。
+                /* 卡片间隔 = 与阅读同一套侧任务节拍（Config.readSpan，默认 90 秒）。
                    原来这里是 1.5~3 秒 —— 5 张卡十几秒内打完，属于明显的机器行为。 */
                 const isLast = idx >= todo.length;
                 if (pacer) {
-                    beatGap = pacer.nextGap(beatGap, !!last && last.ok);
+                    beatGap = pacer.readGap();
                     if (!isLast) {
                         if (deadline > 0 && !pacer.fits(deadline, beatGap)) {
                             outOfTime = true;
@@ -8459,6 +8465,17 @@ const __scBgKeepAlive = (function() {
 
         startGap() { return this.minMs(); },
 
+        /* ── 侧任务节拍（阅读 / 活动卡片 / 每日活动 / 二次扫描 / 国际版卡片）──
+           与搜索分开：搜索走 Config.span（下限 180 秒 = 3 分钟），
+           侧任务走 Config.readSpan（下限 60、默认 90 秒）。
+           这样「把搜索放慢防风控」不会连带把阅读和卡片拖成 3 分钟一张。 */
+        READ_MIN_MS: 60 * 1000,
+        readSpanMs() {
+            const s = Number(GM_getValue("Config.readSpan", 90)) || 90;
+            return Math.max(this.READ_MIN_MS, Math.round(s * 1000));
+        },
+        readGap() { return this.readSpanMs(); },
+
         /* 兼容旧调用点：现在没有退让，上限就等于基准值。 */
         maxMs() { return this.spanMs(); },
 
@@ -8861,7 +8878,7 @@ const __scBgKeepAlive = (function() {
             const maxPerDay = 10;
             const target = Math.min(Math.max(Math.ceil((max - cur) / pointsPerArticle), 1), maxPerDay);
             Utils.log("📖", `今日还可阅读 ${target} 篇（上限 ${maxPerDay} 篇/天，每篇约 ${pointsPerArticle} 分）`);
-            let gap = SEARCH_PACER.startGap();
+            let gap = SEARCH_PACER.readGap();
             const readCap = Date.now() + 8 * 60 * 1000;
             const readDeadline = (Number(roundDeadline) || 0) > 0 ? Math.min(Number(roundDeadline), readCap) : readCap;
             let successCount = 0;
@@ -8905,7 +8922,7 @@ const __scBgKeepAlive = (function() {
                         Utils.log("🟡", `阅读第 ${i + 1} 篇无新增积分（返回 p:${result.points}，isDuplicate:${result.isDuplicate}）`);
                     }
                 }
-                gap = SEARCH_PACER.nextGap(gap, advanced);
+                gap = SEARCH_PACER.readGap();
                 if (cur >= max) {
                     Utils.log("📖", `阅读进度已满（${cur}/${max}），提前结束`);
                     break;
@@ -9043,7 +9060,7 @@ const __scBgKeepAlive = (function() {
 
             const shouldSkip = (card) => card.kind === "quiz" && !Utils.taskOn("Tasks.quiz");
             let ok = 0, fail = 0;
-            let gap = SEARCH_PACER.startGap();
+            let gap = SEARCH_PACER.readGap();
             let outOfTime = false;
             for (const card of cards) {
                 await RegionGuard.guard("活动卡片");
@@ -9058,7 +9075,7 @@ const __scBgKeepAlive = (function() {
                 await SEARCH_PACER.beat(gap);
                 const result = await API.claimCard(card, { attempts: 2 });
                 result ? ok++ : fail++;
-                gap = SEARCH_PACER.nextGap(gap, !!result);
+                gap = SEARCH_PACER.readGap();
             }
             let pending = 0;
             let lockedNow = 0;
@@ -9327,7 +9344,7 @@ const __scBgKeepAlive = (function() {
 
             const maxRounds = 3;
             let totalOk = 0, totalFail = 0, remain = -1;
-            let gap = SEARCH_PACER.startGap();
+            let gap = SEARCH_PACER.readGap();
             let outOfTime = false;
 
             for (let round = 1; round <= maxRounds; round++) {
@@ -9398,7 +9415,7 @@ const __scBgKeepAlive = (function() {
                     await SEARCH_PACER.beat(gap);
                     const res = await API.claimCard(card, round === 1 ? { attempts: 2 } : {});
                     if (res) { totalOk++; doneIds.add(card.offerId); } else { totalFail++; }
-                    gap = SEARCH_PACER.nextGap(gap, !!res);
+                    gap = SEARCH_PACER.readGap();
                 }
                 if (roundOutOfTime) {
                     outOfTime = true;
@@ -9527,9 +9544,9 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🟡", "出口探测未通过，国际版每日活动本轮跳过");
                 return false;
             }
-            /* 节拍与搜索/阅读共用 Config.span（最低 180 秒）：
+            /* 节拍与阅读/卡片共用 Config.readSpan（默认 90 秒，搜索那套是 180 秒）：
                5 张卡之间各隔一个节拍，而不是十几秒内连着打完。 */
-            const gap = SEARCH_PACER.startGap();
+            const gap = SEARCH_PACER.readGap();
             const today = Utils.getTodayNum();
             const key = "Config.intlDailyDate";
             const st = GM_getValue(key, null);
@@ -9900,7 +9917,7 @@ const __scBgKeepAlive = (function() {
                     if (newCards.length > 0) {
                         Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
                         let ok = 0, fail = 0;
-                        let rescanGap = SEARCH_PACER.startGap();
+                        let rescanGap = SEARCH_PACER.readGap();
                         for (const card of newCards) {
                             await RegionGuard.guard("二次扫描");
                             this.tick();
@@ -9913,7 +9930,7 @@ const __scBgKeepAlive = (function() {
                             await SEARCH_PACER.beat(rescanGap);
                             const result = await API.claimCard(card);
                             result ? ok++ : fail++;
-                            rescanGap = SEARCH_PACER.nextGap(rescanGap, !!result);
+                            rescanGap = SEARCH_PACER.readGap();
                         }
                         Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
                     } else {
@@ -10371,7 +10388,8 @@ const __scBgKeepAlive = (function() {
         text += `间隔来源：Config.span（基准最低 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒，不设上限；配更小会夹到 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒）\n`;
         text += `间隔自证：日志里的「本轮周期 N 秒」才是间隔；「等待 N 秒」是扣掉观察/复核后的剩余，比周期小是正常的\n`;
         text += `限流刹车：连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手（间隔本身不再拖慢）\n`;
-        text += `阅读/卡片节拍：复用同一套，间隔同为 ${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒\n`;
+        const readBase = Math.round(SEARCH_PACER.readSpanMs() / 1000);
+        text += `阅读/卡片节拍：独立一套，间隔 ${Math.max(SEARCH_PACER.READ_MIN_MS / 1000, readBase - SEARCH_PACER.JITTER_MS / 1000)} ~ ${readBase + SEARCH_PACER.JITTER_MS / 1000} 秒（Config.readSpan，基准 ${readBase} 秒，最低 ${SEARCH_PACER.READ_MIN_MS / 1000} 秒）\n`;
         if (pacer.last) {
             text += `上一轮：${pacer.last.attempts} 次搜索 / 记账 ${pacer.last.credits} 次（实测最大间隔 ${pacer.last.peak} 秒）\n`;
         } else {

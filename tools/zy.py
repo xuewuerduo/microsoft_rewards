@@ -188,7 +188,7 @@ Python 脚本负责：启动前获取热搜词 → 启动浏览器 → 登录检
 # 项目版本号：与根目录 microsoft-rewards.user.js 的 @version / CHANGELOG 保持一致。
 # 部署到容器后可用 `python3 zy.py --version` 或看启动日志首行核对是不是同一份。
 # 发版时与 JS @version 一起 bump（当前 1.0.3 为待发版）。
-__version__ = "1.0.8"
+__version__ = "1.0.9"
 
 import os
 import re
