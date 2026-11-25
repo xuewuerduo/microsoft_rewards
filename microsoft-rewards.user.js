@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.0.7
+// @version      1.0.8
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）；任务逻辑取自 #8787 v1.5.9，另加多账号 CDP 端口认领、zy.py 日志转发、中文热搜词池
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -69,10 +69,10 @@ Config:
         type: checkbox
         default: true
     span:
-        title: 搜索间隔(最低 90，可设更大；实际在基准 ±15 秒内浮动)
+        title: 搜索间隔(最低 180，可设更大；实际在基准 ±15 秒内浮动)
         type: number
-        default: 90
-        min: 90
+        default: 180
+        min: 180
         unit: 秒
     winTime:
         title: 运行时段(格式 开始-结束，如 09:00-23:00；前后时间相同则全天不限)
@@ -239,6 +239,20 @@ const __scBgKeepAlive = (function() {
             });
             const span = Number(GM_getValue("Config.span", 90)) || 90;
             if (span < 90) { try { GM_setValue("Config.span", 90); } catch (_) {} }
+            try { GM_setValue(KEY, true); } catch (_) {}
+        } catch (_) {}
+    })();
+
+    /* 一次性策略落地（v1.0.8）：搜索间隔下限 90 秒 → 180 秒（3 分钟）。
+       1.0.7 的迁移只把 span 抬到 90，跑过那一版的 profile 已经是 90 了，这里补一次到 180。
+       用独立标记，且只动 span —— 不碰那三个任务开关，免得把用户后来手动打开的通知又关掉。
+       只跑一次，之后手动把间隔调小不会被反复覆盖（但运行时仍受 SPAN_MIN_MS=180s 夹紧）。 */
+    (() => {
+        const KEY = "Config.policyApplied.v108";
+        try {
+            if (GM_getValue(KEY, false)) return;
+            const span = Number(GM_getValue("Config.span", 180)) || 180;
+            if (span < 180) { try { GM_setValue("Config.span", 180); } catch (_) {} }
             try { GM_setValue(KEY, true); } catch (_) {}
         } catch (_) {}
     })();
@@ -7766,7 +7780,7 @@ const __scBgKeepAlive = (function() {
                之前一张卡失败能刷 6 行（每种形态各一行），完全没法看。 */
             const failed = [];
             const pacer = (typeof SEARCH_PACER !== "undefined") ? SEARCH_PACER : null;
-            /* 节拍基准：没传就按 Config.span（最低 90 秒）走，绝不定死成几秒 */
+            /* 节拍基准：没传就按 Config.span（最低 180 秒）走，绝不定死成几秒 */
             let beatGap = Number(gap) > 0 ? Number(gap) : (pacer ? pacer.startGap() : 60 * 1000);
             let outOfTime = false;
             let idx = 0;
@@ -7804,7 +7818,7 @@ const __scBgKeepAlive = (function() {
                 } else {
                     failed.push({ name, reason: lastReason });
                 }
-                /* 卡片间隔 = 与搜索/阅读同一套节拍（Config.span，最低 90 秒）。
+                /* 卡片间隔 = 与搜索/阅读同一套节拍（Config.span，最低 180 秒）。
                    原来这里是 1.5~3 秒 —— 5 张卡十几秒内打完，属于明显的机器行为。 */
                 const isLast = idx >= todo.length;
                 if (pacer) {
@@ -8414,11 +8428,11 @@ const __scBgKeepAlive = (function() {
     const ROUND_BUDGET_MS = 30 * 60 * 1000;
 
     const SEARCH_PACER = {
-        /* 节拍：以 Config.span（默认 90 秒）为基准 ±15 秒浮动，按「本次已用掉多少」补齐，
-           使间隔落在 span±15 秒（配 90 → 75~105 秒）。
-           SPAN_MIN_MS=90 秒是基准下限，FLOOR_MS=5 秒只防负数。
+        /* 节拍：以 Config.span（默认 180 秒）为基准 ±15 秒浮动，按「本次已用掉多少」补齐，
+           使间隔落在 span±15 秒（配 180 → 165~195 秒）。
+           SPAN_MIN_MS=180 秒（3 分钟）是基准下限，FLOOR_MS=5 秒只防负数。
            限流保护靠两条刹车：NO_CREDIT_LIMIT（连续 10 分钟零记账收手）、MAX_ATTEMPTS。 */
-        SPAN_MIN_MS: 90 * 1000,
+        SPAN_MIN_MS: 180 * 1000,
         JITTER_MS: 15 * 1000,
         /* 浮动后的绝对下限：只用来挡住负数/0，不是「最慢不能低于 1 分钟」 */
         FLOOR_MS: 5 * 1000,
@@ -8433,10 +8447,10 @@ const __scBgKeepAlive = (function() {
         STREAK_STOP: 10,
         RETRY_GAP: 5 * 60 * 1000,
 
-        /* 用户配置的间隔基准：只保证不低于 SPAN_MIN_MS（90 秒），
+        /* 用户配置的间隔基准：只保证不低于 SPAN_MIN_MS（180 秒 = 3 分钟），
            上限完全交给用户 —— 想设 10 分钟、1 小时都行。 */
         spanMs() {
-            const span = Number(GM_getValue("Config.span", 90)) || 90;
+            const span = Number(GM_getValue("Config.span", 180)) || 180;
             const ms = Math.round(span * 1000);
             return Math.max(this.SPAN_MIN_MS, ms);
         },
@@ -9513,7 +9527,7 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🟡", "出口探测未通过，国际版每日活动本轮跳过");
                 return false;
             }
-            /* 节拍与搜索/阅读共用 Config.span（最低 90 秒）：
+            /* 节拍与搜索/阅读共用 Config.span（最低 180 秒）：
                5 张卡之间各隔一个节拍，而不是十几秒内连着打完。 */
             const gap = SEARCH_PACER.startGap();
             const today = Utils.getTodayNum();
