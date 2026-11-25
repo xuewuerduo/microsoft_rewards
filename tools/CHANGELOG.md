@@ -12,6 +12,32 @@
 
 ---
 
+## v1.0.7 · 2026-11-25（仅脚本：关闭三项任务 + 搜索间隔调大）
+
+- **改了什么**（`microsoft-rewards.user.js`，其余 5 个 py 仅版本号对齐，无行为变化）：
+  - `Tasks.desktopWeekly`（桌面应用每周专属任务）默认值 `true → false`。
+  - `Tasks.intlDaily`（国际版每日活动）默认值 `true → false`。
+  - `Notice.bro`（浏览器通知（当前脚本））默认值 `true → false` —— 只跳过 `GM_notification`，
+    企业微信 / 钉钉 / 飞书 / PushMe / Bark 等 webhook 推送**照常**。
+  - 搜索间隔：`Config.span` 默认 `60 → 90` 秒、下限 `60 → 90`；`SEARCH_PACER.SPAN_MIN_MS 60s → 90s`。
+    实际节拍为基准 ±15 秒（75~105 秒）。阅读卡片、国际版卡片复用同一套节拍，一起变慢。
+- **为什么**：这三项对当前账号没有收益/不需要（桌面专属要切应用 UA、国际版只有额外 25 分、
+  容器里没人看浏览器通知）；搜索间隔从 60 秒抬到 90 秒是为了进一步降低风控概率。
+- **关键细节**：只改 `UserConfig` 的 `default` 对老 profile 无效 —— 脚本猫首次加载时已把默认值写进
+  GM 存储，之后一直读存储里的 `true`。所以在脚本启动处加了一次性迁移（`Config.policyApplied.v107` 标记）：
+  首次运行把 `Tasks.desktopWeekly` / `Tasks.intlDaily` / `Notice.bro` 写成 `false`，并把
+  `Config.span < 90` 的抬到 90。只跑一次，之后你在面板手动改回来不会被覆盖。
+- **影响文件**：`microsoft-rewards.user.js`（+ 5 个 py 的 `__version__`）、`tools/CHANGELOG.md`、
+  `tools/release-notes/v1.0.7.md`。
+- **怎么验证**：
+  1. `node --check microsoft-rewards.user.js` 通过。
+  2. 跑起来后日志里不再有「🖥️ 桌面应用每周专属任务」「🌍 国际版每日活动」的执行行，
+     完成汇报里这两项显示 `⏭️ 已关闭`。
+  3. 搜索节拍日志 / 诊断面板应显示基准 90 秒（75~105 秒浮动）。
+  4. 不给浏览器弹通知，但 webhook 渠道仍收到推送。
+- **生效步骤**：`git push origin main`（raw 即发布）；各账号下次 `zy.py` 启动校准拉到 1.0.7，
+  首次加载时执行迁移把旧配置改成新值。
+
 ## v1.0.6 · 2026-11-25（脚本 + sc_deploy + zy.py：安装/更新源改为 Gitea raw）
 
 > 版本号全项目 `1.0.6`：脚本 `@version` + 5 个 py `__version__`。**撤回 v1.0.4 / v1.0.5 的「本地文件直推」方案**，

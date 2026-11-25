@@ -59,7 +59,7 @@ sc_deploy.py — 脚本猫（ScriptCat）扩展 + 脚本「一键部署 / 更新
 """
 
 # 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于部署核对。
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 
 import argparse
 import atexit
