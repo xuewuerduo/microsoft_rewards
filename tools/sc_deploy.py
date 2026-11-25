@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-sc_deploy.py — 脚本猫（ScriptCat）扩展 + 商店脚本「一键部署 / 更新」工具（CDP，全程无 GUI）
+sc_deploy.py — 脚本猫（ScriptCat）扩展 + 脚本「一键部署 / 更新」工具（CDP，全程无 GUI）
 
 本文件由 sc_update.py 与 sc_e2e.py 合并而来，既可作为命令行工具，也可被 zy.py 直接 import。
 放在 zy.py 同一目录即可被自动加载。
+
+脚本来源统一是 **Gitea raw**（SCRIPT_SOURCE_URL）：
+  https://gitea.zh-cc.top/lilonglong/microsoft_rewards/raw/branch/main/microsoft-rewards.user.js
+安装和更新都走这个地址，脚本猫的 checkUpdateUrl 也指这里 —— 改完 js 推到 main 就生效，
+不再依赖脚本猫商店同步 / webhook。
 
 ═══ 给新用户的浏览器装「扩展 + 脚本」（装完即可用）═══
   python3 sc_deploy.py --install --port 9222
   python3 sc_deploy.py --install --port 9222 \
       --ext /app/extensions/scriptcat --user-dir /data/profiles/user-long
   做四件事：① 确认/加载脚本猫扩展 ② 开「允许用户脚本」+开发者模式
-            ③ 装商店最新脚本并启用 ④ 写 Cookie 永久授权（--run 再跑一次）
+            ③ 装 Gitea raw 上的最新脚本并启用 ④ 写 Cookie 永久授权（--run 再跑一次）
 
-═══ 手动更新脚本到商店最新版 ═══
+═══ 手动更新脚本到源站最新版 ═══
   python3 sc_deploy.py --update --port 9222
   python3 sc_deploy.py --update                  # 四个账号 9222~9225 一起
-  把 checkUpdateUrl 回正到商店真实地址 → checkScriptUpdate(system) → 等版本号变化。
+  把 checkUpdateUrl 指向 Gitea raw → checkScriptUpdate(system) → 等版本号变化。
   与脚本猫「每天自动更新」走完全同一条路径，不造版本、不改脚本内容。
 
 ═══ 只看版本 ═══
@@ -27,7 +32,7 @@ sc_deploy.py — 脚本猫（ScriptCat）扩展 + 商店脚本「一键部署 / 
   python3 sc_deploy.py --self-test --keep
 
 其他开关：
-  --script 6006        商店脚本 ID（默认 6006 = 微软积分（优化版））
+  --script 6006        兼容旧参数（脚本 ID 已不参与取源，来源固定 Gitea raw）
   --name 微软积分      按脚本名片段筛选已装脚本
   --hosts a,b,c        配合 --grant-cookie / --install 的 Cookie 域名清单
   --run                授权后让脚本跑一次
@@ -54,7 +59,7 @@ sc_deploy.py — 脚本猫（ScriptCat）扩展 + 商店脚本「一键部署 / 
 """
 
 # 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于部署核对。
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 import argparse
 import atexit
@@ -78,7 +83,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, quote
 
 # ============================ 常量 ============================
-DEFAULT_SCRIPT_ID = "6006"                 # scriptcat 商店脚本 ID：微软积分（优化版）
+DEFAULT_SCRIPT_ID = "6006"                 # 兼容旧参数用；脚本来源已改为 Gitea raw
 SCRIPT_NAME_HINT = "微软积分"               # 用来从已装脚本列表里认出目标脚本
 
 
@@ -116,7 +121,13 @@ RPC_PREFIX = "serviceWorker/script/"
 # 扩展页面路径随版本变化：1.5.x 是 src/options.html，更老的版本是 pages/manage.html
 EXT_PAGE_CANDIDATES = ["src/options.html", "pages/manage.html", "pages/options.html"]
 
-STORE_API = "https://scriptcat.org/api/v2/scripts/%s/code"
+STORE_API = "https://scriptcat.org/api/v2/scripts/%s/code"   # 商店 API（仅历史对照，已不作为真源）
+# 脚本的唯一真源：Gitea raw。脚本猫的 checkUpdateUrl 直接指这里——
+# 改完 js 推到 main 分支就生效，不再依赖商店同步 / webhook。
+SCRIPT_SOURCE_URL = os.getenv(
+    "SC_SCRIPT_SOURCE",
+    "https://gitea.zh-cc.top/lilonglong/microsoft_rewards/raw/branch/main/microsoft-rewards.user.js",
+).strip()
 # 脚本猫对 @grant GM_cookie 按「域名 + 时长」授权；这里预先写 allow 记录，
 # 等价于弹窗里选「永久 + 允许」，不需要 GUI、不需要真的跑一遍。
 COOKIE_HOSTS_DEFAULT = [
@@ -601,23 +612,32 @@ def call(sess, method, data=None, timeout_ms=15000):
     return _unwrap(rpc(sess, method, data, timeout_ms), method)
 
 
-# ============================ 商店脚本 ============================
-def fetch_store_script(script_id=DEFAULT_SCRIPT_ID):
-    """取商店脚本源码：返回 (code, version, meta)"""
-    req = urllib.request.Request(STORE_API % script_id, headers={"User-Agent": UA})
+# ==================== 脚本源（Gitea raw = 唯一真源） ====================
+def fetch_store_script(script_id=DEFAULT_SCRIPT_ID, url=None):
+    """取脚本源码：默认拉 Gitea raw（唯一真源），返回 (code, version, meta)。
+
+    script_id 只为兼容旧调用保留；url 可临时换源（如镜像 / 本地 HTTP）。
+    """
+    src = (url or SCRIPT_SOURCE_URL).strip()
+    req = urllib.request.Request(src, headers={
+        "User-Agent": UA,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    })
     with urllib.request.urlopen(req, timeout=40) as r:
-        d = json.loads(r.read().decode("utf-8", "replace"))
-    sc = ((d.get("data") or {}).get("script") or {})
-    code = sc.get("code") or ""
-    if not code.startswith("//"):
-        raise RuntimeError("商店返回的 code 不像 userscript（前 40 字: %r）" % code[:40])
-    return code, str(sc.get("version") or "?"), sc
+        code = r.read().decode("utf-8", "replace")
+    if "==UserScript==" not in code[:400] or not code.lstrip().startswith("//"):
+        raise RuntimeError("源站返回的内容不像 userscript（前 60 字: %r）" % code[:60])
+    ver = meta_version(code)
+    return code, ver, {"version": ver, "name": meta_name(code), "url": src}
 
 
-def store_script_url(script_id, name):
-    """商店里脚本的真实 .user.js 地址（ScriptCat 正常安装后 checkUpdateUrl 就是它）"""
-    return "https://scriptcat.org/scripts/code/%s/%s.user.js" % (
-        script_id, urllib.parse.quote(name))
+def store_script_url(script_id=None, name=None):
+    """脚本的安装/更新地址（ScriptCat 把它存成 checkUpdateUrl）——统一指 Gitea raw。
+
+    保留原函数名和签名，老调用点不用改；script_id / name 现在不参与拼 URL。
+    """
+    return SCRIPT_SOURCE_URL
 
 
 def meta_name(code, default=SCRIPT_NAME_HINT):
@@ -638,22 +658,6 @@ def script_ver(hit):
     return str(v if v is not None else "?")
 
 
-def read_local_script(path):
-    """读本地 .user.js 文件：返回 (code, version, name)。
-
-    文件不像用户脚本（不以注释头开头）或读不到 @version 时抛异常 ——
-    宁可报错，也不要把半截/错误内容灌进浏览器。
-    """
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        code = f.read()
-    if not code.lstrip().startswith("//"):
-        raise RuntimeError("本地文件不像 userscript（开头 40 字: %r）" % code[:40])
-    ver = meta_version(code)
-    if ver == "?":
-        raise RuntimeError("本地文件读不到 @version: %s" % path)
-    return code, ver, meta_name(code)
-
-
 def find_script(sess, hint=SCRIPT_NAME_HINT):
     """按名字片段找已装脚本，返回 (script|None, 说明)"""
     ok, data = call(sess, "getAllScripts", None)
@@ -668,19 +672,6 @@ def find_script(sess, hint=SCRIPT_NAME_HINT):
 def enable_script(sess, uuid):
     ok, data = call(sess, "enables", {"uuids": [uuid], "enable": True})
     return ok, data
-
-
-def disable_script(sess, uuid):
-    ok, data = call(sess, "enables", {"uuids": [uuid], "enable": False})
-    return ok, data
-
-
-def find_scripts(sess, hint=SCRIPT_NAME_HINT):
-    """按名字片段找**全部**匹配脚本（用来发现重复安装）。"""
-    ok, data = call(sess, "getAllScripts", None)
-    if not ok or not isinstance(data, list):
-        return []
-    return [s for s in data if hint and hint in (s.get("name") or "")]
 
 
 def install_script(sess, code, timeout_ms=180000):
@@ -1995,13 +1986,10 @@ def get_status(port, name_hint=SCRIPT_NAME_HINT, ext_id=None, log=print):
 
 def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_ID,
                    name_hint=SCRIPT_NAME_HINT, grant=True, run=False,
-                   install_ext=True, hosts=None, log=print,
-                   code_override=None, keep_store_check=False):
+                   install_ext=True, hosts=None, log=print):
     """给一个正在运行的浏览器把「脚本猫扩展 + 脚本」准备到可用状态（幂等）。
 
     新用户第一次跑任务时调用即可；已装过的只会做「启用 + 授权」这类轻量检查。
-    code_override：传入本地 .user.js 的代码时，**新装也装这份本地版**（不去商店取），
-                   并且默认关掉商店自动检查更新（keep_store_check=True 可保留）。
     返回 dict：ok / ext_id / installed / version / uuid / steps / detail
     """
     res = {"ok": False, "port": port, "ext_id": None, "installed": False,
@@ -2046,7 +2034,7 @@ def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_I
     ok_users = allow_userscripts(port, log=log)
     st(ok_users, "允许运行用户脚本", "" if ok_users else "脚本猫可能拒绝安装/运行脚本")
 
-    # ③ 脚本：没有就装商店最新，有就确保启用
+    # ③ 脚本：没有就装 Gitea raw 最新，有就确保启用
     ws = ext_page_ws(port, ext_id=ext_id, log=log)
     if not ws:
         res["detail"] = "拿不到扩展页面（扩展未加载或页面路径不匹配）"
@@ -2061,21 +2049,15 @@ def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_I
             res["installed"] = False
             st(True, "脚本已安装", "%s v%s" % (hit.get("name"), script_ver(hit)))
         else:
-            src = "本地文件"
-            if code_override:
-                code = code_override
-                store_ver = meta_version(code)
-            else:
-                try:
-                    code, store_ver, _ = fetch_store_script(script_id)
-                except Exception as e:
-                    res["detail"] = "取商店脚本失败: %s" % e
-                    st(False, "取商店脚本", str(e)[:160])
-                    return res
-                src = "商店"
+            try:
+                code, store_ver, _ = fetch_store_script(script_id)
+            except Exception as e:
+                res["detail"] = "取源站脚本失败: %s" % e
+                st(False, "取源站脚本", str(e)[:160])
+                return res
             name_hint = meta_name(code, name_hint)
             ok, data = install_script(sess, code)
-            st(ok, "安装%s脚本" % src, ("v%s" % store_ver) if ok else str(data)[:200])
+            st(ok, "安装源站脚本", ("v%s" % store_ver) if ok else str(data)[:200])
             if not ok:
                 res["detail"] = "installByCode 失败: %s" % str(data)[:200]
                 return res
@@ -2104,19 +2086,14 @@ def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_I
 
         # 更新地址：installByCode 装出来的是空，旧安装可能被指到已关掉的本地服务。
         # 不补的话脚本猫每天「检查更新」不知道去哪查，表现就是永远停在当前版本。
-        # 本地直推模式下反过来：默认关掉自动检查，否则商店旧版会把本地版盖回去。
         try:
             hit_now, _ = find_script(sess, name_hint)
             cur_url = str((hit_now or {}).get("checkUpdateUrl") or "")
-            su_url = store_script_url(script_id, (hit_now or {}).get("name") or name_hint)
-            if code_override and not keep_store_check:
-                ok_u, data_u = call(sess, "setCheckUpdateUrl",
-                                    {"uuid": uuid, "checkUpdate": False, "checkUpdateUrl": su_url})
-                st(ok_u, "关闭商店自动检查（以本地文件为准）", "" if ok_u else str(data_u)[:160])
-            elif res["installed"] or not cur_url.startswith("https://scriptcat.org/scripts/code/"):
+            if res["installed"] or not cur_url.startswith(SCRIPT_SOURCE_URL):
+                su_url = store_script_url(script_id, (hit_now or {}).get("name") or name_hint)
                 ok_u, data_u = call(sess, "setCheckUpdateUrl",
                                     {"uuid": uuid, "checkUpdate": True, "checkUpdateUrl": su_url})
-                st(ok_u, "更新地址指向商店", "" if ok_u else str(data_u)[:160])
+                st(ok_u, "更新地址指向 Gitea raw", "" if ok_u else str(data_u)[:160])
         except Exception as e:
             st(False, "设置更新地址", str(e)[:160])
     finally:
@@ -2145,7 +2122,7 @@ def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_I
 
 def update_script(port, script_id=DEFAULT_SCRIPT_ID, name_hint=SCRIPT_NAME_HINT,
                   ext_id=None, log=print, poll_times=12, poll_gap=1.5):
-    """把已装脚本更新到商店最新版（与每天自动更新同一条路径）。
+    """把已装脚本更新到 Gitea raw 最新版（与每天自动更新同一条路径）。
 
     返回 dict：ok / before / after / store / changed / detail
     """
@@ -2170,11 +2147,11 @@ def update_script(port, script_id=DEFAULT_SCRIPT_ID, name_hint=SCRIPT_NAME_HINT,
         try:
             code, store_ver, _ = fetch_store_script(script_id)
         except Exception as e:
-            out["detail"] = "取商店版本失败: %s" % e
+            out["detail"] = "取源站版本失败: %s" % e
             return out
         out["store"] = store_ver
         name_hint = meta_name(code, name_hint)
-        log("    · 商店最新：v%s" % store_ver)
+        log("    · 源站最新：v%s" % store_ver)
     finally:
         sess.close()
 
@@ -2224,109 +2201,7 @@ def update_script(port, script_id=DEFAULT_SCRIPT_ID, name_hint=SCRIPT_NAME_HINT,
             enable_script(sess, h2.get("uuid") or uuid)
             log("    · 已重新启用脚本")
         if not out["ok"] and final != store_ver:
-            out["detail"] = "版本没变（商店 v%s / 当前 v%s）" % (store_ver, final)
-        return out
-    finally:
-        sess.close()
-
-
-# ============================ 本地脚本直推（不依赖商店） ============================
-def install_local(port, code, name_hint=SCRIPT_NAME_HINT, ext_id=None, log=print,
-                  keep_store_check=False, poll_times=10, poll_gap=1.0):
-    """把本地 .user.js 代码**直接**推给脚本猫里已装的脚本，绕开商店。
-
-    原理：脚本猫的 `installByCode`（upsertBy=user）按脚本名就地覆盖，
-    所以只要把本地文件内容灌进去，版本号就变成代码头里的 @version ——
-    商店有没有同步上去完全不重要。
-
-    注意两点：
-      1. 覆盖后仍要确保 status=1（启用），否则定时任务不会跑；
-      2. 默认关掉该脚本的「商店自动检查更新」，否则脚本猫每天还会去商店比对，
-         把本地开发版覆盖回商店的旧版本。
-    返回 dict：ok / installed / before / after / want / uuid_changed / detail
-    """
-    out = {"ok": False, "port": port, "installed": False, "before": None,
-           "after": None, "want": meta_version(code), "uuid_changed": False,
-           "detail": ""}
-    ext_id = ext_id or resolve_ext_id(port, log=log)
-    ws = ext_page_ws(port, ext_id=ext_id, log=log)
-    if not ws:
-        out["detail"] = "拿不到扩展页面（扩展没加载？）"
-        return out
-    sess = _CdpSession(ws)
-    try:
-        hit, why = find_script(sess, name_hint)
-        old_uuid = (hit or {}).get("uuid") or ""
-        out["before"] = script_ver(hit) if hit else None
-        out["installed"] = not bool(hit)
-        if hit:
-            log("    · 当前：%s v%s（status=%s）" % (hit.get("name"), out["before"], hit.get("status")))
-        else:
-            log("    · 尚未安装（%s），直接装本地版" % why)
-
-        ok, data = install_script(sess, code)
-        if not ok:
-            out["detail"] = "installByCode 失败: %s" % str(data)[:200]
-            return out
-
-        final = out["before"]
-        h2 = hit
-        for _ in range(max(1, poll_times)):
-            time.sleep(poll_gap)
-            h2, _ = find_script(sess, name_hint)
-            if h2:
-                final = script_ver(h2)
-                if str(final) == str(out["want"]):
-                    break
-        out["after"] = final
-        if not h2:
-            out["detail"] = "装完后找不到脚本"
-            return out
-        out["uuid_changed"] = bool(old_uuid and h2.get("uuid") and h2.get("uuid") != old_uuid)
-        if out["uuid_changed"]:
-            log("    · uuid 变化：%s → %s（Cookie 授权要重写）"
-                % (old_uuid[:8], str(h2.get("uuid"))[:8]))
-
-        if h2.get("status") != 1:
-            enable_script(sess, h2.get("uuid") or old_uuid)
-            time.sleep(0.6)
-            h3, _ = find_script(sess, name_hint)
-            h2 = h3 or h2
-            log("    · 已启用脚本（status=%s）" % (h2 or {}).get("status"))
-
-        # 更新地址：默认关掉商店自动检查，避免本地版被商店旧版覆盖回去。
-        try:
-            uu = (h2 or {}).get("uuid") or old_uuid
-            if keep_store_check:
-                url = store_script_url(DEFAULT_SCRIPT_ID, (h2 or {}).get("name") or name_hint)
-                call(sess, "setCheckUpdateUrl",
-                     {"uuid": uu, "checkUpdate": True, "checkUpdateUrl": url})
-            else:
-                url = store_script_url(DEFAULT_SCRIPT_ID, (h2 or {}).get("name") or name_hint)
-                call(sess, "setCheckUpdateUrl",
-                     {"uuid": uu, "checkUpdate": False, "checkUpdateUrl": url})
-                log("    · 已关闭该脚本的商店自动检查（以本地文件为准）")
-        except Exception as e:
-            log("    [!] 设置更新地址失败: %s" % str(e)[:160])
-
-        out["ok"] = str(out["after"]) == str(out["want"])
-
-        # 防重复：万一 upsertBy 没按名字覆盖、而是新建了一条，两个同名脚本会同时跑
-        # （双倍请求、日志互相干扰）。这里把「不是本次这条」的同名脚本停掉。
-        try:
-            keep = (h2 or {}).get("uuid") or ""
-            dups = [s for s in find_scripts(sess, name_hint)
-                    if (s.get("uuid") or "") and (s.get("uuid") or "") != keep]
-            if dups:
-                log("    [!] 发现同名脚本 %d 个（疑似重复安装），停用多余的：%s"
-                    % (len(dups), ", ".join(str((d.get("uuid") or "")[:8]) for d in dups)))
-                for d in dups:
-                    disable_script(sess, d.get("uuid"))
-        except Exception as e:
-            log("    [!] 重复脚本检查失败: %s" % str(e)[:120])
-
-        if not out["ok"]:
-            out["detail"] = "装完版本是 v%s（期望 v%s）" % (out["after"], out["want"])
+            out["detail"] = "版本没变（源站 v%s / 当前 v%s）" % (store_ver, final)
         return out
     finally:
         sess.close()
@@ -2453,7 +2328,7 @@ def launch_chrome(port, profile, keep=False):
 
 
 def self_test(args):
-    """本地从零验证：装扩展 → 允许用户脚本 → 装商店脚本 → 授权 → 运行 → 验证静默更新"""
+    """本地从零验证：装扩展 → 允许用户脚本 → 装源站脚本 → 授权 → 运行 → 验证静默更新"""
     ext_dir = args.ext or os.path.join(HERE, ".chrome-test", "sc-ext")
     if not os.path.isdir(ext_dir):
         raise SystemExit("扩展目录不存在: %s（先用 --ext 指定脚本猫解包目录）" % ext_dir)
@@ -2481,7 +2356,7 @@ def self_test(args):
         print("\n③ 允许用户脚本")
         step(allow_userscripts(port), "允许用户脚本")
 
-        print("\n④ 安装商店脚本 #%s" % args.script)
+        print("\n④ 安装源站脚本 %s" % SCRIPT_SOURCE_URL)
         r = ensure_browser(port, ext_dir=ext_dir, script_id=args.script,
                            grant=False, log=lambda m: print(m))
         step(r["ok"], "脚本已安装并启用", "v%s" % r.get("version"))
@@ -2529,14 +2404,14 @@ def self_test(args):
                     if ver2 == new_ver:
                         break
                 step(ver2 == new_ver, "静默更新生效", "v%s → v%s" % (store_ver, ver2))
-                # 收尾：把 profile 还原成「商店地址 + 商店最新版」
+                # 收尾：把 profile 还原成「Gitea raw 地址 + 源站最新版」
                 call(sess, "setCheckUpdateUrl",
                      {"uuid": uuid, "checkUpdate": True,
                       "checkUpdateUrl": store_script_url(args.script, name)})
                 call(sess, "installByCode", {"uuid": uuid, "code": code, "upsertBy": "user"},
                      timeout_ms=180000)
                 call(sess, "enables", {"uuids": [uuid], "enable": True})
-                step(True, "还原为商店最新版", "v%s" % store_ver)
+                step(True, "还原为源站最新版", "v%s" % store_ver)
             finally:
                 sess.close()
     finally:
@@ -2555,20 +2430,21 @@ def self_test(args):
 # ============================ 命令行 ============================
 def main():
     ap = argparse.ArgumentParser(
-        description="脚本猫扩展 + 商店脚本 一键安装/更新（CDP，无需 GUI）",
+        description="脚本猫扩展 + 脚本(Gitea raw) 一键安装/更新（CDP，无需 GUI）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-V", "--version", action="version", version=f"sc_deploy.py {__version__}")
     ap.add_argument("port_arg", nargs="?", type=int, metavar="PORT",
                     help="单个 CDP 端口（如 9222）")
     ap.add_argument("--port", type=int, help="同位置参数，指定 CDP 端口")
     ap.add_argument("--install", "--bootstrap", dest="install", action="store_true",
-                    help="给浏览器装扩展 + 商店脚本 + Cookie 授权（新用户用）")
-    ap.add_argument("--update", action="store_true", help="手动更新脚本到商店最新版")
+                    help="给浏览器装扩展 + 源站脚本 + Cookie 授权（新用户用）")
+    ap.add_argument("--update", action="store_true", help="手动更新脚本到 Gitea raw 最新版")
     ap.add_argument("--status", action="store_true", help="只看已装脚本版本")
     ap.add_argument("--allow-userscripts", action="store_true", help="只开「允许用户脚本」")
     ap.add_argument("--grant-cookie", action="store_true", help="只写 Cookie 永久授权")
     ap.add_argument("--self-test", action="store_true", help="本地起独立浏览器跑全流程验证")
-    ap.add_argument("--script", default=DEFAULT_SCRIPT_ID, help="商店脚本 ID（默认 %s）" % DEFAULT_SCRIPT_ID)
+    ap.add_argument("--script", default=DEFAULT_SCRIPT_ID,
+                    help="兼容旧参数（来源已固定为 Gitea raw，不再按 ID 取码）")
     ap.add_argument("--name", default="", help="已装脚本名片段（默认「%s」）" % SCRIPT_NAME_HINT)
     ap.add_argument("--ext", default="", help="脚本猫解包扩展目录（自动安装扩展时用）")
     ap.add_argument("--user-dir", default="", help="浏览器 profile 目录（用于从 Preferences 认扩展 ID）")
@@ -2668,10 +2544,10 @@ def main():
         eid = resolve_ext_id(port, ext_dir=ext_dir, user_dir=args.user_dir or None)
         r = update_script(port, script_id=args.script, name_hint=name_hint, ext_id=eid)
         if r["ok"]:
-            print("  ✅ v%s → v%s（商店 v%s）%s" % (
+            print("  ✅ v%s → v%s（源站 v%s）%s" % (
                 r["before"], r["after"], r["store"], "" if r["changed"] else " 已是最新"))
         else:
-            print("  ❌ %s（v%s → v%s，商店 v%s）" % (
+            print("  ❌ %s（v%s → v%s，源站 v%s）" % (
                 r["detail"], r["before"], r["after"], r["store"]))
             ok_all = False
     return 0 if ok_all else 1

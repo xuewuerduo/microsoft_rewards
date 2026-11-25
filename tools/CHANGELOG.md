@@ -12,53 +12,46 @@
 
 ---
 
-## v1.0.5 · 2026-11-25（仅 zy.py / sc_deploy.py：本地 js 直推，不再依赖商店同步）
+## v1.0.6 · 2026-11-25（脚本 + sc_deploy + zy.py：安装/更新源改为 Gitea raw）
 
-> 📦 脚本 `@version 1.0.5`（11416 行 / 617145 字节 / md5 `47e6db7d`，内容与 1.0.4 只差版本号一行）；
-> zy.py 5480 行 / md5 `e89e12a9`；sc_deploy.py 2653 行 / md5 `beb05cfc`。
+> 版本号全项目 `1.0.6`：脚本 `@version` + 5 个 py `__version__`。**撤回 v1.0.4 / v1.0.5 的「本地文件直推」方案**，
+> 那两版只存在于本地提交，从未发版、未部署，现整体回退。
 
-- **改了什么**（核心是给 zy.py 加了一条"本地即真相"的更新通道）：
-  - `sc_deploy.install_local()`：把本地 `.user.js` 的代码用 `installByCode`（`upsertBy=user`）
-    **就地覆盖**脚本猫里已装的脚本，完全不经过商店；覆盖后自动确保 `status=1`（启用），
-    默认 `checkUpdate=False`（不让商店旧版盖回来，`SC_LOCAL_KEEP_STORE_CHECK=1` 可保留）。
-  - `sc_deploy.read_local_script()`：读本地文件并校验（不是 userscript / 读不到 `@version` 直接报错）。
-  - `ensure_browser()` 新增 `code_override`：**新账号首次安装也装本地版**，不再因为商店没同步就装旧版。
-  - zy.py `_ensure_script_latest()`：判据从"跟商店比"改成"跟本地文件比"（`SC_LOCAL_UPDATE=1`，默认）；
-    找不到本地文件才退回商店口径。`--update-script`、`--install-script`、启动配置日志同步改造。
-  - **内容指纹**层：`/app/data/zy-script-pushed.json` 记「账号 → 版本 + sha1 前 16 位」。
-    只比版本号会漏掉"改了 js 忘了 bump"——现在版本相同但内容变了也会覆盖，并在日志里提示 bump。
-  - **uuid 变化兜底**：覆盖后若脚本 uuid 变了，自动重写 Cookie 永久授权（授权是按 uuid 存的，
-    不补的话下一轮会弹窗）。
-- **为什么**：商店那条 webhook 一直只能回 `{"code":0,"data":null}`（收到请求但零个脚本被处理），
-  改了多少次版本都同步不上去。既然如此，就让 zy.py 直接读本机文件推给浏览器，
-  商店只当备份渠道。
-- **影响文件**：`microsoft-rewards.user.js`（仅 `@version`）、`tools/zy.py`、`tools/sc_deploy.py`、
-  5 个 py 的 `__version__`、`tools/README.md`（发布链路改成 A/B 两条）。
+- **改了什么**：
+  - **脚本头部** `microsoft-rewards.user.js`：新增 `@installURL` / `@downloadURL` / `@updateURL`，
+    三条全部指向 `https://gitea.zh-cc.top/lilonglong/microsoft_rewards/raw/branch/main/microsoft-rewards.user.js`。
+    脚本猫安装或检查更新时以它为准，与商店无关。
+  - **`tools/sc_deploy.py`**：
+    - 新增 `SCRIPT_SOURCE_URL`（环境变量 `SC_SCRIPT_SOURCE` 可覆盖）。
+    - `fetch_store_script()` 改为直接 GET 该 raw 地址，返回 `(code, 版本, 元信息)`；版本用头部 `@version` 自己解析，
+      不再相信商店 API 的 version 字段。内容校验从「以 // 开头」收紧到「含 `==UserScript==`」，
+      防止反代/登录页被当成脚本灌进浏览器。
+    - `store_script_url()` 一律返回 `SCRIPT_SOURCE_URL`（函数名保留，老调用点不动），因此 `--install` 装的和
+      `--update` 设的 `checkUpdateUrl` 都是 raw。
+  - **`tools/zy.py`**：
+    - `_store_script_version()` → `_source_script_version()`，缓存变量 `_STORE_VER/_STORE_LOCK` → `_SRC_VER/_SRC_LOCK`。
+      校准逻辑不变：已装 < 源站 → 触发 `checkScriptUpdate`；已装 == 源站 → 跳过；已装 > 源站（本地开发版）→ 不降级。
+    - 面向人的文案统一从「商店」改为「源站 / Gitea raw」，免得下次看日志以为还在等商店同步。
+  - `tools/README.md` 的「发布链路」「发版方式」两节重写为 raw 链路；新增 `tools/release-notes/v1.0.6.md`。
+- **为什么改**：脚本猫商店的 webhook 本质是「仓库 push 触发器」，不接受请求体里直接携带代码（21 种组合试过全部
+  `data:null`），线上长期停在旧版；v1.0.5 的本地直推虽然能绕过商店，但要 `zy.py + sc_deploy.py + js` 三份文件同时
+  部署，还得处理 `installByCode` 换 uuid 之后的 Cookie 授权重写，链路重、失败点多。改源码最直接：
+  **raw 就是唯一真源，push 即发布**。
+- **影响文件**：`microsoft-rewards.user.js`、`tools/sc_deploy.py`、`tools/zy.py`、`tools/sc_diag.py`、
+  `tools/sc_pub.py`、`tools/sc_sync.py`（后三者仅版本号）、`tools/README.md`、本 CHANGELOG、`tools/release-notes/v1.0.6.md`。
 - **怎么验证**：
-  1. 部署后 zy.py 启动日志出现 `📤 本地脚本 = /app/microsoft-rewards.user.js（v1.0.5）`；
-  2. 开跑前校准出现 `📤 账号 X 脚本 v1.0.4 落后于本地 v1.0.5，用本地文件覆盖…`
-     → `✅ 账号 X 脚本已更新：v1.0.4 → v1.0.5（来源：本地 …）`；
-  3. 再跑一次应变成 `🔎 账号 X 脚本已是最新 v1.0.5（与本地文件内容指纹一致）`（幂等）；
-  4. `python3 zy.py --script-status` 首行打印本地版本，各账号行应与之一致。
-- **怎么回退**：`SC_LOCAL_UPDATE=0` 即恢复"跟商店比版本"的老口径，不需要改代码。
-
----
-
-## v1.0.4 · 2026-11-25（版本号推进 + 商店同步）
-
-> 📦 脚本 `@version 1.0.4`（11416 行 / 617145 字节 / md5 `6c2840ce`），zy.py 5263 行 / md5 `61eb8ace`。
-
-- **改了什么**：代码内容与 v1.0.3 **完全一致**，只把版本号 1.0.3 → 1.0.4（脚本 + 5 个 py 的 `__version__`），用于把 v1.0.3 的改动正式同步到商店。
-- **为什么**：v1.0.3 的改动在商店侧一直没落地（线上版本号虽显示 1.0.3，但同步链路未验证通过）；同版本号重复推送会被商店按"无变化"跳过，故推进一个版本号重新发。
-- **影响文件**：`microsoft-rewards.user.js`、`tools/{zy,sc_deploy,sc_diag,sc_sync,sc_pub}.py`、`tools/release-notes/v1.0.4.md`。
-- **怎么验证**：`node --check` 通过；商店版本变为 1.0.4 后，`python3 tools/sc_sync.py --check` 应输出「本地 v1.0.4 ｜ 线上 v1.0.4」。
-- **功能改动**：无。v1.0.3 的 cron 30 分钟、任务顺序随机、阈值联动等内容见下一节，不再重复。
-
----
+  1. 匿名拉 raw：`curl -sI https://gitea.zh-cc.top/lilonglong/microsoft_rewards/raw/branch/main/microsoft-rewards.user.js`
+     应 `200`（脚本猫的更新检查没有登录态，必须匿名可读）。
+  2. `python3 -c "import sys;sys.path.insert(0,'tools');import sc_deploy as sd;print(sd.fetch_store_script()[1])"`
+     应打印 raw 当前的 `@version`。
+  3. `py_compile` 全过；`python3 zy.py --version` 输出 1.0.6。
+- **生效步骤**：① `git push origin main`（这一步就是发布，raw 立刻变新）；② 已装账号下次跑 `zy.py` 时启动校准会
+  发现「已装 v旧 < 源站 v1.0.6」并自动更新，想立刻生效就 `python3 zy.py --update-script`。
+- **注意**：以后改脚本**必须 bump `@version`**，否则脚本猫认为没新版，zy.py 也会判定「已是最新」。
 
 ## v1.0.3 · 2026-11-24（脚本 + zy.py：cron 20→30 分钟，维持产能的完整联动改动）
 
-> 📦 脚本本体 `@version 1.0.3`（11416 行 / 617145 字节 / md5 `2d967463`），zy.py 5263 行 / md5 `47de26ec`。
+> ⚠️ 代码已改完并提交推送，但**未发商店、未部署容器**。脚本本体 `@version 1.0.3`（11416 行，md5 `2d967463`），zy.py 5263 行，md5 `47de26ec`。
 >
 > **版本号已全项目对齐**：脚本 `@version` 与 5 个 py 脚本的 `__version__ = "1.0.3"`、本节版本号三者一致。zy.py 启动日志首行打印版本、`--version/-V` 可查；sc_deploy/sc_diag/sc_sync/sc_pub 均支持 `--version/-V`。`tools/README.md` 的「版本约定」同步更新。
 
