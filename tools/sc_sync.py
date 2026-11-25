@@ -9,7 +9,7 @@
 """
 
 # 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于核对。
-__version__ = "1.0.3"
+__version__ = "1.0.5"
 
 import argparse
 import json

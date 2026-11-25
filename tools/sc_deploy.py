@@ -54,7 +54,7 @@ sc_deploy.py — 脚本猫（ScriptCat）扩展 + 商店脚本「一键部署 / 
 """
 
 # 项目版本号：与 microsoft-rewards.user.js @version / zy.py 保持一致，便于部署核对。
-__version__ = "1.0.3"
+__version__ = "1.0.5"
 
 import argparse
 import atexit
@@ -638,6 +638,22 @@ def script_ver(hit):
     return str(v if v is not None else "?")
 
 
+def read_local_script(path):
+    """读本地 .user.js 文件：返回 (code, version, name)。
+
+    文件不像用户脚本（不以注释头开头）或读不到 @version 时抛异常 ——
+    宁可报错，也不要把半截/错误内容灌进浏览器。
+    """
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        code = f.read()
+    if not code.lstrip().startswith("//"):
+        raise RuntimeError("本地文件不像 userscript（开头 40 字: %r）" % code[:40])
+    ver = meta_version(code)
+    if ver == "?":
+        raise RuntimeError("本地文件读不到 @version: %s" % path)
+    return code, ver, meta_name(code)
+
+
 def find_script(sess, hint=SCRIPT_NAME_HINT):
     """按名字片段找已装脚本，返回 (script|None, 说明)"""
     ok, data = call(sess, "getAllScripts", None)
@@ -652,6 +668,19 @@ def find_script(sess, hint=SCRIPT_NAME_HINT):
 def enable_script(sess, uuid):
     ok, data = call(sess, "enables", {"uuids": [uuid], "enable": True})
     return ok, data
+
+
+def disable_script(sess, uuid):
+    ok, data = call(sess, "enables", {"uuids": [uuid], "enable": False})
+    return ok, data
+
+
+def find_scripts(sess, hint=SCRIPT_NAME_HINT):
+    """按名字片段找**全部**匹配脚本（用来发现重复安装）。"""
+    ok, data = call(sess, "getAllScripts", None)
+    if not ok or not isinstance(data, list):
+        return []
+    return [s for s in data if hint and hint in (s.get("name") or "")]
 
 
 def install_script(sess, code, timeout_ms=180000):
@@ -1966,10 +1995,13 @@ def get_status(port, name_hint=SCRIPT_NAME_HINT, ext_id=None, log=print):
 
 def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_ID,
                    name_hint=SCRIPT_NAME_HINT, grant=True, run=False,
-                   install_ext=True, hosts=None, log=print):
-    """给一个正在运行的浏览器把「脚本猫扩展 + 商店脚本」准备到可用状态（幂等）。
+                   install_ext=True, hosts=None, log=print,
+                   code_override=None, keep_store_check=False):
+    """给一个正在运行的浏览器把「脚本猫扩展 + 脚本」准备到可用状态（幂等）。
 
     新用户第一次跑任务时调用即可；已装过的只会做「启用 + 授权」这类轻量检查。
+    code_override：传入本地 .user.js 的代码时，**新装也装这份本地版**（不去商店取），
+                   并且默认关掉商店自动检查更新（keep_store_check=True 可保留）。
     返回 dict：ok / ext_id / installed / version / uuid / steps / detail
     """
     res = {"ok": False, "port": port, "ext_id": None, "installed": False,
@@ -2029,15 +2061,21 @@ def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_I
             res["installed"] = False
             st(True, "脚本已安装", "%s v%s" % (hit.get("name"), script_ver(hit)))
         else:
-            try:
-                code, store_ver, _ = fetch_store_script(script_id)
-            except Exception as e:
-                res["detail"] = "取商店脚本失败: %s" % e
-                st(False, "取商店脚本", str(e)[:160])
-                return res
+            src = "本地文件"
+            if code_override:
+                code = code_override
+                store_ver = meta_version(code)
+            else:
+                try:
+                    code, store_ver, _ = fetch_store_script(script_id)
+                except Exception as e:
+                    res["detail"] = "取商店脚本失败: %s" % e
+                    st(False, "取商店脚本", str(e)[:160])
+                    return res
+                src = "商店"
             name_hint = meta_name(code, name_hint)
             ok, data = install_script(sess, code)
-            st(ok, "安装商店脚本", ("v%s" % store_ver) if ok else str(data)[:200])
+            st(ok, "安装%s脚本" % src, ("v%s" % store_ver) if ok else str(data)[:200])
             if not ok:
                 res["detail"] = "installByCode 失败: %s" % str(data)[:200]
                 return res
@@ -2066,11 +2104,16 @@ def ensure_browser(port, ext_dir=None, user_dir=None, script_id=DEFAULT_SCRIPT_I
 
         # 更新地址：installByCode 装出来的是空，旧安装可能被指到已关掉的本地服务。
         # 不补的话脚本猫每天「检查更新」不知道去哪查，表现就是永远停在当前版本。
+        # 本地直推模式下反过来：默认关掉自动检查，否则商店旧版会把本地版盖回去。
         try:
             hit_now, _ = find_script(sess, name_hint)
             cur_url = str((hit_now or {}).get("checkUpdateUrl") or "")
-            if res["installed"] or not cur_url.startswith("https://scriptcat.org/scripts/code/"):
-                su_url = store_script_url(script_id, (hit_now or {}).get("name") or name_hint)
+            su_url = store_script_url(script_id, (hit_now or {}).get("name") or name_hint)
+            if code_override and not keep_store_check:
+                ok_u, data_u = call(sess, "setCheckUpdateUrl",
+                                    {"uuid": uuid, "checkUpdate": False, "checkUpdateUrl": su_url})
+                st(ok_u, "关闭商店自动检查（以本地文件为准）", "" if ok_u else str(data_u)[:160])
+            elif res["installed"] or not cur_url.startswith("https://scriptcat.org/scripts/code/"):
                 ok_u, data_u = call(sess, "setCheckUpdateUrl",
                                     {"uuid": uuid, "checkUpdate": True, "checkUpdateUrl": su_url})
                 st(ok_u, "更新地址指向商店", "" if ok_u else str(data_u)[:160])
@@ -2182,6 +2225,108 @@ def update_script(port, script_id=DEFAULT_SCRIPT_ID, name_hint=SCRIPT_NAME_HINT,
             log("    · 已重新启用脚本")
         if not out["ok"] and final != store_ver:
             out["detail"] = "版本没变（商店 v%s / 当前 v%s）" % (store_ver, final)
+        return out
+    finally:
+        sess.close()
+
+
+# ============================ 本地脚本直推（不依赖商店） ============================
+def install_local(port, code, name_hint=SCRIPT_NAME_HINT, ext_id=None, log=print,
+                  keep_store_check=False, poll_times=10, poll_gap=1.0):
+    """把本地 .user.js 代码**直接**推给脚本猫里已装的脚本，绕开商店。
+
+    原理：脚本猫的 `installByCode`（upsertBy=user）按脚本名就地覆盖，
+    所以只要把本地文件内容灌进去，版本号就变成代码头里的 @version ——
+    商店有没有同步上去完全不重要。
+
+    注意两点：
+      1. 覆盖后仍要确保 status=1（启用），否则定时任务不会跑；
+      2. 默认关掉该脚本的「商店自动检查更新」，否则脚本猫每天还会去商店比对，
+         把本地开发版覆盖回商店的旧版本。
+    返回 dict：ok / installed / before / after / want / uuid_changed / detail
+    """
+    out = {"ok": False, "port": port, "installed": False, "before": None,
+           "after": None, "want": meta_version(code), "uuid_changed": False,
+           "detail": ""}
+    ext_id = ext_id or resolve_ext_id(port, log=log)
+    ws = ext_page_ws(port, ext_id=ext_id, log=log)
+    if not ws:
+        out["detail"] = "拿不到扩展页面（扩展没加载？）"
+        return out
+    sess = _CdpSession(ws)
+    try:
+        hit, why = find_script(sess, name_hint)
+        old_uuid = (hit or {}).get("uuid") or ""
+        out["before"] = script_ver(hit) if hit else None
+        out["installed"] = not bool(hit)
+        if hit:
+            log("    · 当前：%s v%s（status=%s）" % (hit.get("name"), out["before"], hit.get("status")))
+        else:
+            log("    · 尚未安装（%s），直接装本地版" % why)
+
+        ok, data = install_script(sess, code)
+        if not ok:
+            out["detail"] = "installByCode 失败: %s" % str(data)[:200]
+            return out
+
+        final = out["before"]
+        h2 = hit
+        for _ in range(max(1, poll_times)):
+            time.sleep(poll_gap)
+            h2, _ = find_script(sess, name_hint)
+            if h2:
+                final = script_ver(h2)
+                if str(final) == str(out["want"]):
+                    break
+        out["after"] = final
+        if not h2:
+            out["detail"] = "装完后找不到脚本"
+            return out
+        out["uuid_changed"] = bool(old_uuid and h2.get("uuid") and h2.get("uuid") != old_uuid)
+        if out["uuid_changed"]:
+            log("    · uuid 变化：%s → %s（Cookie 授权要重写）"
+                % (old_uuid[:8], str(h2.get("uuid"))[:8]))
+
+        if h2.get("status") != 1:
+            enable_script(sess, h2.get("uuid") or old_uuid)
+            time.sleep(0.6)
+            h3, _ = find_script(sess, name_hint)
+            h2 = h3 or h2
+            log("    · 已启用脚本（status=%s）" % (h2 or {}).get("status"))
+
+        # 更新地址：默认关掉商店自动检查，避免本地版被商店旧版覆盖回去。
+        try:
+            uu = (h2 or {}).get("uuid") or old_uuid
+            if keep_store_check:
+                url = store_script_url(DEFAULT_SCRIPT_ID, (h2 or {}).get("name") or name_hint)
+                call(sess, "setCheckUpdateUrl",
+                     {"uuid": uu, "checkUpdate": True, "checkUpdateUrl": url})
+            else:
+                url = store_script_url(DEFAULT_SCRIPT_ID, (h2 or {}).get("name") or name_hint)
+                call(sess, "setCheckUpdateUrl",
+                     {"uuid": uu, "checkUpdate": False, "checkUpdateUrl": url})
+                log("    · 已关闭该脚本的商店自动检查（以本地文件为准）")
+        except Exception as e:
+            log("    [!] 设置更新地址失败: %s" % str(e)[:160])
+
+        out["ok"] = str(out["after"]) == str(out["want"])
+
+        # 防重复：万一 upsertBy 没按名字覆盖、而是新建了一条，两个同名脚本会同时跑
+        # （双倍请求、日志互相干扰）。这里把「不是本次这条」的同名脚本停掉。
+        try:
+            keep = (h2 or {}).get("uuid") or ""
+            dups = [s for s in find_scripts(sess, name_hint)
+                    if (s.get("uuid") or "") and (s.get("uuid") or "") != keep]
+            if dups:
+                log("    [!] 发现同名脚本 %d 个（疑似重复安装），停用多余的：%s"
+                    % (len(dups), ", ".join(str((d.get("uuid") or "")[:8]) for d in dups)))
+                for d in dups:
+                    disable_script(sess, d.get("uuid"))
+        except Exception as e:
+            log("    [!] 重复脚本检查失败: %s" % str(e)[:120])
+
+        if not out["ok"]:
+            out["detail"] = "装完版本是 v%s（期望 v%s）" % (out["after"], out["want"])
         return out
     finally:
         sess.close()

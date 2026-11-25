@@ -87,8 +87,14 @@
  可选 SC_SCRIPT_ID             scriptcat 商店脚本 ID（默认 6006 微软积分（优化版））
  可选 SC_SCRIPT_NAME           已装脚本名片段（默认「微软积分」）
  可选 SC_EXT_DIR               脚本猫解包扩展目录（默认从 /app/extensions、/data/extensions 找）
- 可选 SC_AUTO_UPDATE           任务开跑前校准「已装脚本 vs 商店最新」，落后就更新
+ 可选 SC_AUTO_UPDATE           任务开跑前校准「已装脚本 vs 应有版本」，落后就更新
                                 （默认 1；0=只在 --update-script 时手动更新）
+ 可选 SC_LOCAL_UPDATE          用**本地 .user.js** 作为「应有版本」的唯一依据（默认 1）：
+                                找到本地文件就直接把代码灌进脚本猫覆盖（installByCode），
+                                完全不依赖「脚本猫商店有没有同步上去」。设 0 = 退回跟商店比版本。
+ 可选 SC_LOCAL_SCRIPT          本地 .user.js 路径（默认自动找：仓库根 → zy.py 同目录 → 当前目录）
+ 可选 SC_LOCAL_KEEP_STORE_CHECK  本地直推时是否保留该脚本的「商店自动检查更新」
+                                （默认 0=关掉，以本地文件为准；1=保留，商店更新会覆盖本地版）
  可选 SC_EXT_UPDATE            任务开始前校准脚本猫扩展插件版本
                                 （默认 1；0=不检查扩展，只校准脚本）
  可选 SC_EXT_REPO              扩展版本来源仓库（默认 scriptscat/scriptcat）
@@ -134,8 +140,9 @@
        一致 → 继续检查用户脚本更新 → 放行任务；不一致 → reload 扩展（不重启浏览器）。
 
    命令行维护参数（面板正常运行时不带参数，行为完全不变）
-     python3 zy.py --update-script    手动把签到脚本更新到商店最新版
-                                      （浏览器没在跑会临时拉起，完成后自动关闭）
+     python3 zy.py --update-script    手动把本地 .user.js 推进各账号的脚本猫
+                                      （找不到本地文件才退回商店最新版；
+                                        浏览器没在跑会临时拉起，完成后自动关闭）
      python3 zy.py --update-ext       手动把脚本猫扩展对齐到线上最新版
                                       （先刷本地目录：GitHub 加速站下载解包；
                                         再逐账号 reload 对齐，不重启浏览器）
@@ -187,8 +194,8 @@ Python 脚本负责：启动前获取热搜词 → 启动浏览器 → 登录检
 
 # 项目版本号：与根目录 microsoft-rewards.user.js 的 @version / CHANGELOG 保持一致。
 # 部署到容器后可用 `python3 zy.py --version` 或看启动日志首行核对是不是同一份。
-# 发版时与 JS @version 一起 bump（当前 1.0.3 为待发版）。
-__version__ = "1.0.3"
+# 发版时与 JS @version 一起 bump（当前 1.0.4）。
+__version__ = "1.0.5"
 
 import os
 import re
@@ -196,6 +203,7 @@ import json
 import sys
 import time
 import random
+import hashlib
 import shutil
 import glob
 import signal
@@ -307,6 +315,11 @@ LAUNCH_CHECK_SECONDS = float(os.getenv("LAUNCH_CHECK_SECONDS", "6"))
 RUN_START_RANDOM = os.getenv("RUN_START_RANDOM", "1").strip().lower() not in ("0", "false", "no", "off")
 # 随机开机时刻落盘（同一天只摇一次，面板重启任务不会重新摇号）
 RUN_START_STATE = os.getenv("RUN_START_STATE", "/app/data/zy-run-start.json")
+# 本地脚本推送记录：{账号: {ver, md5}}。用来判「内容变了但 @version 没改」——
+# 只比版本号会漏掉「改了 js 忘了 bump」的情况，这里补一层内容指纹。
+SCRIPT_PUSH_STATE = os.getenv(
+    "SCRIPT_PUSH_STATE",
+    os.path.join(os.path.dirname(RUN_START_STATE or "/app/data/x"), "zy-script-pushed.json"))
 # 账号独立启动（默认 1）：面板早于 ACCOUNT_STAGGER_BEFORE_HHMM 拉起 zy.py 时，
 # 5 个账号的开机时刻在 RUN_WINDOW 内「一把摇好」，之后各自到点启动自己的浏览器 ——
 # 五个账号真正错开，而不是串行等前一个跑完再启下一个。
@@ -415,6 +428,15 @@ SC_EXT_DIR = os.getenv("SC_EXT_DIR", "")                # 脚本猫解包扩展�
 SC_AUTO_UPDATE = os.getenv("SC_AUTO_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
 # 同上，顺带校准脚本猫扩展插件本身（磁盘解包目录有新版本就 reload；商店版点一次更新）
 SC_EXT_UPDATE = os.getenv("SC_EXT_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
+# 📤 本地脚本直推（默认开）：直接读本机的 .user.js 覆盖脚本猫里已装的脚本，
+# 版本比对也跟这个文件比 —— 不再依赖「脚本猫商店有没有同步上去」。
+# 这就是「本地改了 js → 到点自动生效」的通道：把新文件放到 zy.py 能看到的位置即可。
+# 留空 = 自动找：<仓库根>/microsoft-rewards.user.js、<zy.py 同目录>/microsoft-rewards.user.js。
+SC_LOCAL_SCRIPT = os.getenv("SC_LOCAL_SCRIPT", "").strip()
+SC_LOCAL_UPDATE = os.getenv("SC_LOCAL_UPDATE", "1").strip().lower() not in ("0", "false", "no", "off")
+# 本地直推时默认关掉「该脚本的商店自动检查更新」，防止商店旧版把本地版盖回去。
+# 设 1 = 保留商店检查（本地版仍需和商店比版本，商店更新后会被商店版覆盖）。
+SC_LOCAL_KEEP_STORE_CHECK = os.getenv("SC_LOCAL_KEEP_STORE_CHECK", "0").strip().lower() in ("1", "true", "yes", "on")
 # 已废弃：v0.81 起不再等「脚本猫首轮心跳」（实测白等 30~100 秒）。
 # 变量保留只为不打断既有 .env；读进来的值不再参与任何判断。
 SC_CALIB_WAIT_SEC = int(os.getenv("SC_CALIB_WAIT_SEC", "180") or 180)
@@ -1872,6 +1894,8 @@ def _ensure_script_deploy(name: str, user_dir: str, port: int, run: bool = False
         return False
     ext_dir = _scriptcat_ext_dir(user_dir)
     logger.info(f"🧩 检查账号 {name} 的脚本猫扩展/脚本（CDP {port}）...")
+    # 新装一律装本地文件（找得到的话）：新账号不该因为「商店没同步」就装到旧版。
+    local = _local_script()
     try:
         res = sd.ensure_browser(
             port,
@@ -1882,6 +1906,8 @@ def _ensure_script_deploy(name: str, user_dir: str, port: int, run: bool = False
             grant=True,
             run=run,
             log=lambda m: logger.info("   " + str(m).strip()),
+            code_override=(local["code"] if local else None),
+            keep_store_check=SC_LOCAL_KEEP_STORE_CHECK,
         )
     except Exception as e:
         logger.warning(f"  ⚠️ 账号 {name} 脚本猫部署异常（不影响任务继续）: {e}")
@@ -1889,7 +1915,8 @@ def _ensure_script_deploy(name: str, user_dir: str, port: int, run: bool = False
 
     if res.get("ok"):
         if res.get("installed"):
-            logger.info(f"  ✅ 账号 {name} 已装好脚本猫扩展 + 商店脚本 v{res.get('version')}")
+            logger.info(f"  ✅ 账号 {name} 已装好脚本猫扩展 + 脚本 v{res.get('version')}"
+                        f"{'（本地文件）' if local else '（商店）'}")
         else:
             logger.info(f"  ✅ 账号 {name} 脚本已就绪 v{res.get('version')}"
                         f"（{'新装' if res.get('installed') else '沿用已装'}）")
@@ -1912,6 +1939,112 @@ def _ver_tuple(v):
     return tuple(int(x) for x in nums) if nums else None
 
 
+# ── 本地脚本：zy.py 直接读本机 .user.js，作为「脚本该是什么版本」的唯一依据 ──
+# 缓存按 (路径, mtime, 大小) 失效：一轮里多个账号重复问，不会反复读 600KB 文件。
+_LOCAL_SCRIPT = {"sig": None, "info": None, "err": None}
+_LOCAL_SCRIPT_LOCK = threading.Lock()
+LOCAL_SCRIPT_NAME = "microsoft-rewards.user.js"
+
+
+def _local_script_path() -> str:
+    """本地 .user.js 的位置（不存在返回空串）。
+
+    查找顺序：SC_LOCAL_SCRIPT 指定值 → 仓库根（zy.py 的上一级）→ zy.py 同目录
+    → 当前工作目录。容器里通常把 js 和 zy.py 放同一目录（/app）。
+    """
+    if SC_LOCAL_SCRIPT:
+        p = os.path.abspath(os.path.expanduser(SC_LOCAL_SCRIPT))
+        return p if os.path.isfile(p) else ""
+    cands = [
+        os.path.join(HERE, os.pardir, LOCAL_SCRIPT_NAME),   # 仓库根（tools/zy.py 的上一级）
+        os.path.join(HERE, LOCAL_SCRIPT_NAME),              # 与 zy.py 同目录（容器 /app）
+        os.path.join(os.getcwd(), LOCAL_SCRIPT_NAME),
+    ]
+    for c in cands:
+        p = os.path.abspath(c)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _local_script() -> dict:
+    """读本地脚本（带缓存）：返回 {path, code, ver, name} 或 None。
+
+    文件不存在 / 读失败 / 没有 @version 时返回 None —— 调用方据此退回商店比对，
+    不会因为本地文件缺失就把线上脚本弄坏。
+    """
+    if not SC_LOCAL_UPDATE:
+        return None
+    path = _local_script_path()
+    if not path:
+        with _LOCAL_SCRIPT_LOCK:
+            if _LOCAL_SCRIPT["err"] != "missing":
+                logger.info(f"   [i] 没找到本地脚本 {LOCAL_SCRIPT_NAME}（SC_LOCAL_SCRIPT 可指定路径），"
+                            f"本次退回「跟商店比版本」")
+                _LOCAL_SCRIPT["err"] = "missing"
+                _LOCAL_SCRIPT["sig"] = None
+                _LOCAL_SCRIPT["info"] = None
+        return None
+    try:
+        stt = os.stat(path)
+        sig = (path, int(stt.st_mtime), stt.st_size)
+    except OSError:
+        return None
+    with _LOCAL_SCRIPT_LOCK:
+        if _LOCAL_SCRIPT["sig"] == sig and _LOCAL_SCRIPT["info"]:
+            return _LOCAL_SCRIPT["info"]
+    sd = _load_sc_deploy()
+    if not sd:
+        return None
+    try:
+        code, ver, sname = sd.read_local_script(path)
+    except Exception as e:
+        logger.warning(f"   ⚠️ 本地脚本读取失败（本次退回商店比对）：{e}")
+        return None
+    info = {"path": path, "code": code, "ver": ver, "name": sname}
+    with _LOCAL_SCRIPT_LOCK:
+        _LOCAL_SCRIPT.update(sig=sig, info=info, err=None)
+    logger.info(f"   📤 本地脚本：{path}（v{ver}，{len(code) // 1024} KB）")
+    return info
+
+
+def _script_digest(code: str) -> str:
+    """本地脚本内容指纹（只用于「内容有没有变」，不参与安全校验）。"""
+    return hashlib.sha1(code.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _script_state_load() -> dict:
+    try:
+        with open(SCRIPT_PUSH_STATE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _script_state_save(d: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(SCRIPT_PUSH_STATE) or ".", exist_ok=True)
+        tmp = SCRIPT_PUSH_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, SCRIPT_PUSH_STATE)
+    except Exception as e:
+        logger.info(f"   [!] 记录脚本推送状态失败（不影响任务）: {e}")
+
+
+def _script_pushed(name: str) -> dict:
+    rec = _script_state_load().get(name)
+    return rec if isinstance(rec, dict) else {}
+
+
+def _note_script_pushed(name: str, ver: str, digest: str) -> None:
+    d = _script_state_load()
+    d[name] = {"ver": str(ver), "md5": digest,
+               "at": f"{datetime.now():%Y-%m-%d %H:%M:%S}"}
+    _script_state_save(d)
+
+
 def _store_script_version(sd):
     """商店里脚本的最新版本号（带 10 分钟进程内缓存）。取不到返回 None。"""
     now = time.time()
@@ -1931,7 +2064,13 @@ def _store_script_version(sd):
 
 def _ensure_script_latest(name: str, port: int, user_dir: str = None,
                           ext_id: str = None) -> bool:
-    """校准签到脚本版本：比商店旧就更新到最新（幂等，失败不影响任务）。
+    """校准签到脚本版本（幂等，失败不影响任务）。
+
+    两条口径，优先本地：
+      1. **本地文件直推**（SC_LOCAL_UPDATE=1 且找得到 .user.js）：
+         已装版本 < 本地文件 @version → 直接把本地代码灌进脚本猫覆盖。
+         这条不经过商店，所以商店没同步也不影响「改了 js 就生效」。
+      2. 找不到本地文件时退回老口径：跟商店版本比，落后就触发脚本猫更新。
 
     调用时机由调用方决定：正常任务里只在「脚本猫首轮心跳到了、任务还没开跑」时
     统一做一次（见 _pre_task_calibrate），不在浏览器刚拉起时做。
@@ -1954,6 +2093,51 @@ def _ensure_script_latest(name: str, port: int, user_dir: str = None,
             logger.warning(f"  ⚠️ 账号 {name} 读不到已装脚本版本：{st.get('detail') or '未知'}")
             return False
         cur = st.get("version")
+
+        # ── 口径 1：本地 .user.js 直推 ──
+        local = _local_script()
+        if local:
+            want = local["ver"]
+            digest = _script_digest(local["code"])
+            cur_t, want_t = _ver_tuple(cur), _ver_tuple(want)
+            pushed = _script_pushed(name)
+            reason = ""
+            if cur_t is not None and want_t is not None:
+                if cur_t > want_t:
+                    logger.info(f"  🔎 账号 {name} 脚本 v{cur} 比本地 v{want} 新，保留不降级")
+                    return True
+                if cur_t < want_t:
+                    reason = f"v{cur} 落后于本地 v{want}"
+                elif digest != pushed.get("md5"):
+                    reason = (f"版本号同为 v{cur}，但内容变了"
+                              f"（上次推送 {pushed.get('md5') or '无记录'} → 现在 {digest}；"
+                              f"建议下次改代码时顺手 bump @version）")
+                else:
+                    logger.info(f"  🔎 账号 {name} 脚本已是最新 v{cur}（与本地文件内容指纹一致）"
+                                f"{'（已启用）' if st.get('status') == 1 else '（注意：当前未启用）'}")
+                    return True
+            if not reason:
+                reason = f"v{cur} 与本地 v{want} 无法比较版本号，按本地文件覆盖"
+            logger.info(f"  📤 账号 {name} 脚本{reason}，用本地文件覆盖…")
+            r = sd.install_local(port, local["code"], name_hint=SC_SCRIPT_NAME, ext_id=eid,
+                                 log=log, keep_store_check=SC_LOCAL_KEEP_STORE_CHECK)
+            if r.get("ok"):
+                _note_script_pushed(name, want, digest)
+                logger.info(f"  ✅ 账号 {name} 脚本已更新：v{r.get('before')} → v{r.get('after')}"
+                            f"（来源：本地 {local['path']}）")
+                if r.get("uuid_changed"):
+                    # Cookie 授权按 uuid 存，uuid 变了授权就失效，赶紧补写，免得开跑弹窗。
+                    try:
+                        logger.info(f"  🔑 账号 {name} 脚本 uuid 变了，重写 Cookie 授权…")
+                        sd.grant_cookie(port, ext_id=eid, name_hint=SC_SCRIPT_NAME, log=log)
+                    except Exception as e:
+                        logger.warning(f"  ⚠️ 账号 {name} 重写 Cookie 授权失败（可能首次运行弹窗）: {e}")
+                return True
+            logger.warning(f"  ⚠️ 账号 {name} 本地直推未完成：{r.get('detail') or '见上方日志'}"
+                           f"（当前 v{r.get('before')} / 本地 v{r.get('want')}）")
+            return False
+
+        # ── 口径 2：没有本地文件，退回跟商店比 ──
         store = _store_script_version(sd)
         if not store:
             return False
@@ -4507,6 +4691,16 @@ def main():
                            f"自动修复还没试完就会把浏览器关掉，建议设成 {STALL_ALERT_MIN * 2} 以上")
     else:
         logger.info("  SC_IDLE_CLOSE_MIN = 0（未启用零输出止损：报不出完成的账号会挂到收工）")
+    logger.info(f"  SC_AUTO_UPDATE = {'开' if SC_AUTO_UPDATE else '关'}"
+                f"  SC_LOCAL_UPDATE = {'开' if SC_LOCAL_UPDATE else '关'}")
+    _lp = _local_script_path()
+    if _lp:
+        _li = _local_script()
+        logger.info(f"  📤 本地脚本 = {_lp}（v{_li['ver'] if _li else '?'}）"
+                    f"{'' if SC_LOCAL_UPDATE else ' —— 但 SC_LOCAL_UPDATE=0，不直推'}")
+    elif SC_LOCAL_UPDATE:
+        logger.warning(f"  📤 未找到本地脚本 {LOCAL_SCRIPT_NAME}：本次退回「跟商店比版本」"
+                       f"（把 js 放到 zy.py 同目录，或用 SC_LOCAL_SCRIPT 指定路径）")
     logger.info(f"  搜索参数请查看「脚本猫-微软积分商城签到脚本」的 UserConfig 页面配置")
 
     # 单实例保护：若已有同脚本的任务实例在运行，直接退出，避免两个任务
@@ -5054,6 +5248,11 @@ def _cli_script_status() -> int:
     sd = _load_sc_deploy()
     if not sd:
         return 1
+    local = _local_script()
+    if local:
+        print(f"本地脚本：v{local['ver']}  {local['path']}")
+    else:
+        print(f"本地脚本：未找到（将退回跟商店比版本）")
     rc = 0
     for i, acc in enumerate(load_accounts()):
         name = acc["name"]
@@ -5088,7 +5287,11 @@ def _cli_update_scripts(install: bool = False) -> int:
     # 先刷本地扩展包，再起浏览器：手动装/修脚本时浏览器用的是解包目录，
     # 目录还是旧版的话装完脚本还是旧扩展（和正常任务是同一套两段式口径）。
     _prepare_ext_bundle(f"手动{action}前", force=True)
-    logger.info(f"🔧 手动{action}「{SC_SCRIPT_NAME}」脚本（商店 #{SC_SCRIPT_ID}），共 {len(accounts)} 个账号")
+    local = _local_script()
+    if local:
+        logger.info(f"📤 使用本地脚本 {local['path']}（v{local['ver']}），不走商店")
+    logger.info(f"🔧 手动{action}「{SC_SCRIPT_NAME}」脚本（{'本地文件' if local else '商店 #' + SC_SCRIPT_ID}），"
+                f"共 {len(accounts)} 个账号")
     rc = 0
     for i, acc in enumerate(accounts):
         name = acc["name"]
@@ -5118,11 +5321,25 @@ def _cli_update_scripts(install: bool = False) -> int:
             if install:
                 r = sd.ensure_browser(port, ext_dir=ext_dir, user_dir=user_dir,
                                       script_id=SC_SCRIPT_ID, name_hint=SC_SCRIPT_NAME,
-                                      grant=True, run=False, log=log)
+                                      grant=True, run=False, log=log,
+                                      code_override=(local["code"] if local else None),
+                                      keep_store_check=SC_LOCAL_KEEP_STORE_CHECK)
                 if r.get("ok"):
                     logger.info(f"✅ 账号 {name}：扩展 {r.get('ext_id')}，脚本 v{r.get('version')}")
                 else:
                     logger.error(f"❌ 账号 {name}：{r.get('detail') or '安装未完成'}")
+                    rc = 1
+            elif local:
+                # 本地直推：不看商店，直接把本地文件灌进去（--update-script 的主用途）
+                r = sd.install_local(port, local["code"], name_hint=SC_SCRIPT_NAME, log=log,
+                                     keep_store_check=SC_LOCAL_KEEP_STORE_CHECK)
+                if r.get("ok"):
+                    _note_script_pushed(name, local["ver"], _script_digest(local["code"]))
+                    logger.info(f"✅ 账号 {name}：v{r.get('before')} → v{r.get('after')}"
+                                f"（本地 v{local['ver']}）")
+                else:
+                    logger.error(f"❌ 账号 {name}：{r.get('detail')}"
+                                 f"（v{r.get('before')} / 本地 v{r.get('want')}）")
                     rc = 1
             else:
                 r = sd.update_script(port, script_id=SC_SCRIPT_ID,
@@ -5218,7 +5435,7 @@ if __name__ == "__main__":
               f"  （zy.py v{__version__}，与脚本 @version 同步）\n"
               "  不带参数            正常执行面板任务（启动浏览器→登录检查→运行脚本→收工）\n"
               "  -V, --version       打印版本号后退出（部署后核对用）\n"
-              "  --update-script     手动把签到脚本更新到商店最新版（浏览器没在跑会临时拉起）\n"
+              "  --update-script     手动把本地 .user.js 推进各账号脚本猫（无本地文件才用商店）\n"
               "  --update-ext        手动把脚本猫扩展插件更新到最新（磁盘新版/商店）\n"
               "  --install-script    重新安装/修复脚本猫扩展 + 脚本 + Cookie 授权\n"
               "  --script-status     查看各账号已装脚本版本")
